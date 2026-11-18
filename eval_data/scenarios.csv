@@ -1,0 +1,21 @@
+id,log_file,group,expected_error_type,expected_root_cause
+S01,S01_spark_heap_oom.log,spark,SPARK_MEMORY_ERROR,Executor ran out of Java heap memory (java.lang.OutOfMemoryError: Java heap space).
+S02,S02_spark_yarn_killed.log,spark,SPARK_MEMORY_ERROR,YARN killed the executor container for exceeding its memory limit (10.4 GB of 10 GB); memory overhead too low.
+S03,S03_spark_driver_collect_oom.log,spark,SPARK_MEMORY_ERROR,Driver ran out of memory (GC overhead limit exceeded) after collect() pulled a large result to the driver.
+S04,S04_spark_null_udf.log,spark,SPARK_NULL_ERROR,"Null email value reached a Python UDF (NoneType has no attribute strip), causing a NullPointerException."
+S05,S05_spark_null_scala.log,spark,SPARK_NULL_ERROR,"NullPointerException in OrderEnricher.scala line 42, a null value not handled in the transformation."
+S06,S06_spark_corrupt_parquet.log,spark,SPARK_TASK_ERROR,A corrupt or non Parquet file (part-00014.parquet) in the input path made the task fail 4 times and abort the job.
+S07,S07_spark_skew.log,spark,SPARK_TASK_ERROR,Data skew in a join: one task read 38.6 GB of shuffle data against a 190 MB median and failed repeatedly.
+A01,A01_airflow_zero_division.log,airflow,AIRFLOW_DIVISION_ERROR,ZeroDivisionError in compute_conversion_rate: visits was zero.
+A02,A02_airflow_float_division.log,airflow,AIRFLOW_DIVISION_ERROR,ZeroDivisionError (float division by zero) in calculate_margin: revenue was zero.
+A03,A03_airflow_upstream_failed.log,airflow,AIRFLOW_TASK_ERROR,load_fact_sales did not run because one upstream extract task failed (trigger rule all_success).
+A04,A04_airflow_db_connection.log,airflow,AIRFLOW_TASK_ERROR,Airflow task could not connect to the Postgres warehouse (connection timed out on port 5432).
+A05,A05_airflow_keyerror.log,airflow,AIRFLOW_TASK_ERROR,KeyError 'email_address' in map_contacts: the expected field is missing from the source data.
+K01,K01_kafka_commit_failed.log,kafka,KAFKA_ERROR,Consumer offset commit failed because the group rebalanced: processing took longer than max.poll.interval.ms.
+K02,K02_kafka_broker_unavailable.log,kafka,KAFKA_ERROR,"Producer could not reach the Kafka broker at kafka-0.internal:9092, so metadata timed out."
+K03,K03_kafka_offset_out_of_range.log,kafka,KAFKA_ERROR,"Committed offset was deleted by 1 day retention while the consumer was stopped for 3 days, and auto.offset.reset=none."
+K04,K04_kafka_message_too_large.log,kafka,KAFKA_ERROR,Producer message (2.3 MB) larger than max.request.size (1 MB): RecordTooLargeException.
+T01,T01_kafka_inside_airflow.log,tricky,KAFKA_ERROR,Root cause is Kafka: the Airflow task failed because it could not connect to any Kafka broker.
+T02,T02_spark_oom_from_airflow.log,tricky,SPARK_MEMORY_ERROR,Root cause is Spark memory: the Spark job launched by Airflow had executors killed by YARN for exceeding memory (2g executors).
+O01,O01_s3_access_denied.log,out_of_scope,UNKNOWN_ERROR,"Not one of the 6 types: an AWS IAM permission error (role lacks s3:PutObject). The agent should name this, not force a Spark/Airflow/Kafka fix."
+O02,O02_dbt_invalid_column.log,out_of_scope,UNKNOWN_ERROR,"Not one of the 6 types: a dbt / SQL compilation error, invalid column CUSTOMER_REGION_CD. The agent should name this, not force a Spark/Airflow/Kafka fix."

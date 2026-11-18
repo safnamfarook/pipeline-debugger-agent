@@ -3,7 +3,7 @@ from typing import TypedDict, Annotated
 from dotenv import load_dotenv
 
 from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, ToolMessage, SystemMessage
+from langchain_core.messages import HumanMessage, ToolMessage, SystemMessage, AIMessage
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
@@ -55,12 +55,35 @@ def agent_node(state: AgentState) -> AgentState:
             config={"callbacks": [langfuse_handler]}
         )
     except Exception as e:
-        if "tool_use_failed" in str(e):
-            # Retry once without tools on malformed tool call
-            response = llm.invoke(
-                [system] + state["messages"],
-                config={"callbacks": [langfuse_handler]}
-            )
+        error_text = str(e)
+        # Groq reports a malformed tool call in two ways, depending on the model:
+        #   "tool_use_failed"     (seen with llama-3.3-70b-versatile)
+        #   "output_parse_failed" (seen with openai/gpt-oss-120b)
+        is_malformed_tool_call = (
+            "tool_use_failed" in error_text
+            or "output_parse_failed" in error_text
+        )
+        if is_malformed_tool_call:
+            try:
+                # First retry: same call WITH tools, so the agent can still
+                # reach get_fix_suggestion
+                response = llm_with_tools.invoke(
+                    [system] + state["messages"],
+                    config={"callbacks": [langfuse_handler]}
+                )
+            except Exception:
+                try:
+                    # Second retry: WITHOUT tools, so the user still gets an answer
+                    response = llm.invoke(
+                        [system] + state["messages"],
+                        config={"callbacks": [langfuse_handler]}
+                    )
+                except Exception:
+                    # Last resort: a clear message instead of crashing
+                    response = AIMessage(
+                        content="Sorry, I couldn't finish the analysis because the model "
+                                "returned a malformed tool call. Please try again."
+                    )
         else:
             raise e
     return {

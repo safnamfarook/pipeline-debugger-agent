@@ -1,0 +1,7 @@
+26/03/06 16:20:14 INFO SparkContext: Starting job: collect at report_builder.py:88
+26/03/06 16:22:40 INFO DAGScheduler: Job 4 finished: collect at report_builder.py:88, took 146.2 s
+26/03/06 16:22:58 ERROR Utils: Uncaught exception in thread driver-heartbeater
+java.lang.OutOfMemoryError: GC overhead limit exceeded
+    at java.util.Arrays.copyOfRange(Arrays.java:3664)
+    at org.apache.spark.sql.Dataset.collectFromPlan(Dataset.scala:3696)
+Exception in thread "main" java.lang.OutOfMemoryError: GC overhead limit exceeded

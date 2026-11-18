@@ -1,0 +1,6 @@
+26/03/16 03:10:02 INFO TaskSetManager: Finished task 198.0 in stage 4.0 (TID 1203) in 18 s on worker-2 (executor 3) (198/200)
+26/03/16 03:10:05 INFO TaskSetManager: Finished task 199.0 in stage 4.0 (TID 1204) in 21 s on worker-4 (executor 5) (199/200)
+26/03/16 03:52:47 WARN TaskSetManager: Task 17 in stage 4.0 is still running after 2580 s; median task duration is 19 s. Shuffle read for this task: 38.6 GB (median 190 MB).
+26/03/16 04:05:13 ERROR TaskSetManager: Task 17 in stage 4.0 failed 4 times; aborting job
+org.apache.spark.SparkException: Job aborted due to stage failure: Task 17 in stage 4.0 failed 4 times, most recent failure: Lost task 17.3 in stage 4.0 (TID 1290): org.apache.spark.shuffle.FetchFailedException: Too large frame: 2147483657
+26/03/16 04:05:13 INFO DAGScheduler: Job 2 failed: join at sessions_join.py:57, took 3311.4 s

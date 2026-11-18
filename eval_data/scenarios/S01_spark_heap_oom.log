@@ -1,0 +1,8 @@
+26/03/02 14:05:11 INFO DAGScheduler: Submitting 200 missing tasks from ResultStage 3
+26/03/02 14:07:52 ERROR Executor: Exception in task 57.0 in stage 3.0 (TID 412)
+java.lang.OutOfMemoryError: Java heap space
+    at java.util.Arrays.copyOf(Arrays.java:3236)
+    at org.apache.spark.sql.catalyst.expressions.UnsafeRow.copy(UnsafeRow.java:535)
+26/03/02 14:07:52 ERROR SparkUncaughtExceptionHandler: Uncaught exception in thread Thread[Executor task launch worker for task 412,5,main]
+java.lang.OutOfMemoryError: Java heap space
+26/03/02 14:07:53 WARN TaskSetManager: Lost task 57.0 in stage 3.0 (TID 412) (worker-2 executor 4): ExecutorLostFailure

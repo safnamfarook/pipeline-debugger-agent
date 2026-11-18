@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from config import LLM_MODEL
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -57,7 +58,7 @@ async def health():
     return HealthResponse(
         status="healthy",
         version="1.0.0",
-        model="llama-3.3-70b-versatile"
+        model=LLM_MODEL
     )
 
 

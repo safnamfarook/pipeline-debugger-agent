@@ -1,0 +1,6 @@
+26/03/13 22:40:09 ERROR Executor: Exception in task 14.3 in stage 2.0 (TID 88)
+java.io.IOException: Could not read footer for file: s3a://acme-raw/events/date=2026-03-12/part-00014.parquet
+    at org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat$.readParquetFootersInParallel(ParquetFileFormat.scala:458)
+Caused by: java.lang.RuntimeException: s3a://acme-raw/events/date=2026-03-12/part-00014.parquet is not a Parquet file. Expected magic number at tail, but found [12, 0, 0, 0]
+26/03/13 22:40:10 ERROR TaskSetManager: Task 14 in stage 2.0 failed 4 times; aborting job
+org.apache.spark.SparkException: Job aborted due to stage failure: Task 14 in stage 2.0 failed 4 times, most recent failure: Lost task 14.3 in stage 2.0 (TID 88): java.io.IOException: Could not read footer for file

@@ -1,0 +1,1358 @@
+id,group,expected_error_type,expected_root_cause,rules_only_label,rules_only_correct,tools_called,identify_labels,last_identify_label,identify_input,final_answer,iterations,hit_max_iterations,agent_tool_label_correct,error
+S01,spark,SPARK_MEMORY_ERROR,Executor ran out of Java heap memory (java.lang.OutOfMemoryError: Java heap space).,SPARK_MEMORY_ERROR,True,read_log_file > identify_error_type > get_fix_suggestion,SPARK_MEMORY_ERROR,SPARK_MEMORY_ERROR,"26/03/02 14:07:52 ERROR Executor: Exception in task 57.0 in stage 3.0 (TID 412)
+java.lang.OutOfMemoryError: Java heap space
+    at java.util.Arrays.copyOf(Arrays.java:3236)
+    at org.apache.spark.sql.catalyst.expressions.UnsafeRow.copy(UnsafeRow.java:535)
+26/03/02 14:07:52 ERROR SparkUncaughtExceptionHandler: Uncaught exception in thread Thread[Executor task launch worker for task 412,5,main]
+java.lang.OutOfMemoryError: Java heap space
+26/03/02 14:07:53 WARN TaskSetManager: Lost task 57.0 in stage 3.0 (TID 412) (worker-2 executor 4): ExecutorLostFailure","**Diagnosis**
+
+The log you provided (`eval_data/scenarios/S01_spark_heap_oom.log`) shows a classic **Spark executor heap‑space OOM**:
+
+```
+ERROR Executor: Exception in task 57.0 in stage 3.0 (TID 412)
+java.lang.OutOfMemoryError: Java heap space
+    at java.util.Arrays.copyOf(...)
+    at org.apache.spark.sql.catalyst.expressions.UnsafeRow.copy(...)
+ERROR SparkUncaughtExceptionHandler: Uncaught exception in thread [...]
+WARN TaskSetManager: Lost task 57.0 … ExecutorLostFailure
+```
+
+The executor ran out of Java heap while trying to copy an `UnsafeRow`, which typically happens when a single task needs to materialize more data than fits in the executor’s allocated heap (e.g., large shuffles, wide transformations, or data skew).
+
+**Root causes (most common)**  
+
+| Possible cause | Why it matches this log |
+|----------------|--------------------------|
+| **Insufficient executor memory** (default 1 GB‑2 GB) | The OOM occurs early (after ~2 min) while processing 200 tasks, indicating each task exceeds the current heap. |
+| **Large partition / data skew** | A single task (task 57) fails, suggesting that partition held a disproportionate amount of data. |
+| **Heavy in‑memory operations** (e.g., `groupByKey`, `join` without broadcast, `collect`) | The stack trace shows `UnsafeRow.copy`, which is used when Spark materializes rows for such operations. |
+| **Improper memory overhead** | Even if executor memory is set, the off‑heap/overhead may be too low for shuffle buffers. |
+
+**Fix steps**
+
+1. **Increase executor heap memory**  
+   ```scala
+   spark.conf.set(""spark.executor.memory"", ""4g"")   // or higher based on cluster size
+   ```
+   Adjust in `spark-defaults.conf` or the submission command (`--executor-memory 4g`).
+
+2. **Raise memory overhead** (covers JVM overhead, shuffle, and serialization buffers)  
+   ```scala
+   spark.conf.set(""spark.executor.memoryOverhead"", ""1024"")   // 1 GB overhead
+   ```
+
+3. **Re‑partition to smaller, more balanced partitions**  
+   ```scala
+   // Example: before a heavy join or aggregation
+   df = df.repartition(200)   // choose a number that yields ~128‑256 MB per partition
+   ```
+   This reduces per‑task memory pressure.
+
+4. **Mitigate data skew** (if a specific key dominates)  
+   * Use **salting**: add a random prefix to the skewed key before the join, then remove it after.  
+   * Or **broadcast** the smaller side of a join: `broadcast(smallDf)`.
+
+5. **Enable off‑heap memory (optional, for large shuffles)**  
+   ```scala
+   spark.conf.set(""spark.memory.offHeap.enabled"", ""true"")
+   spark.conf.set(""spark.memory.offHeap.size"", ""2g"")
+   ```
+
+6. **Avoid materializing huge rows**  
+   * Prefer `mapPartitions` or `reduceByKey` over `groupByKey`.  
+   * If you need a full `collect`, do it on a filtered/sub‑sampled dataset.
+
+7. **Monitor and tune Spark UI**  
+   * Check the **Storage** and **Executors** tabs for memory usage per stage.  
+   * Look for tasks with unusually high **Shuffle Read/Write** sizes.
+
+**Quick checklist to apply**
+
+- [ ] Increase `spark.executor.memory` (e.g., 4 GB).  
+- [ ] Increase `spark.executor.memoryOverhead` (e.g., 1 GB).  
+- [ ] Add a `repartition` or `coalesce` before the failing transformation.  
+- [ ] Inspect data distribution; apply salting or broadcast join if skew is present.  
+- [ ] Re‑run the job and verify that the failed task no longer crashes.
+
+Implement these changes, re‑submit the Spark job, and the OOM should be resolved. If the problem persists, capture the new logs and share them for deeper analysis (e.g., to check for lingering skew or other memory‑intensive operations).",4,False,True,
+S02,spark,SPARK_MEMORY_ERROR,YARN killed the executor container for exceeding its memory limit (10.4 GB of 10 GB); memory overhead too low.,SPARK_MEMORY_ERROR,True,read_log_file > identify_error_type > get_fix_suggestion,SPARK_MEMORY_ERROR,SPARK_MEMORY_ERROR,"26/03/04 09:58:03 WARN YarnAllocator: Container from a bad node: container_1709541_0004_01_000007 on host: node-5. Exit status: 137.
+26/03/04 09:58:03 ERROR YarnScheduler: Lost executor 6 on node-5: Container killed by YARN for exceeding memory limits. 10.4 GB of 10 GB physical memory used. Consider boosting spark.executor.memoryOverhead.
+26/03/04 09:58:04 WARN TaskSetManager: Lost task 112.1 in stage 7.0 (TID 2290) (node-5 executor 6): ExecutorLostFailure (executor 6 exited caused by one of the running tasks)","**Diagnosis of `eval_data/scenarios/S02_spark_yarn_killed.log`**
+
+| Log excerpt | What it tells us |
+|-------------|------------------|
+| `WARN YarnAllocator: Container from a bad node … Exit status: 137` | The container was killed by YARN (exit 137 = SIGKILL). |
+| `ERROR YarnScheduler: Lost executor 6 … Container killed by YARN for exceeding memory limits. **10.4 GB of 10 GB** physical memory used. **Consider boosting spark.executor.memoryOverhead**` | The executor exceeded its allocated physical memory (including overhead). YARN terminated it. |
+| `WARN TaskSetManager: Lost task … ExecutorLostFailure` | The task that was running on that executor failed because the executor disappeared. |
+
+**Root cause**  
+The Spark job ran out of memory on an executor. YARN killed the container after it used **10.4 GB** of the **10 GB** memory limit, which includes the executor’s JVM heap plus the memory overhead. This is a classic **Spark memory error**.
+
+---
+
+### Fix steps (tailored to this scenario)
+
+1. **Increase executor memory**  
+   ```bash
+   --conf spark.executor.memory=5g   # or higher, depending on cluster capacity
+   ```
+   The heap should be large enough to hold the data structures for the heavy stage.
+
+2. **Increase memory overhead** (the part YARN accounts for outside the JVM heap)  
+   ```bash
+   --conf spark.executor.memoryOverhead=1024   # 1 GB or more
+   ```
+   The log itself suggests boosting `spark.executor.memoryOverhead`.
+
+3. **Tune the number of executors / cores**  
+   - If you have many cores per executor, each task may compete for memory. Consider reducing `spark.executor.cores` (e.g., to 2–4) and increasing the total number of executors.
+
+4. **Re‑partition / reduce data per task**  
+   - Before the memory‑intensive operation (e.g., a large join or aggregation), add:  
+     ```python
+     df = df.repartition(<desired_partitions>)
+     ```
+   - More partitions → smaller data per task → lower per‑executor memory pressure.
+
+5. **Check for data skew**  
+   - If a particular key dominates a join or aggregation, a single executor can be overloaded. Use salting or broadcast joins for small tables to mitigate skew.
+
+6. **Enable off‑heap memory (optional)**  
+   ```bash
+   --conf spark.memory.offHeap.enabled=true
+   --conf spark.memory.offHeap.size=2g
+   ```
+   Off‑heap can relieve pressure on the JVM heap, but only if your workload benefits from it.
+
+7. **Monitor and iterate**  
+   - After applying the changes, re‑run the job and watch the YARN UI / Spark UI for executor memory usage. Adjust the settings until the “Killed by YARN for exceeding memory limits” message disappears.
+
+---
+
+**Bottom line:** The job failed because an executor exceeded its YARN‑allocated memory (10 GB). Increase both the executor heap (`spark.executor.memory`) and the overhead (`spark.executor.memoryOverhead`), and/or reduce the amount of data each executor processes (more partitions, address skew). This should stop YARN from killing the containers and let the Spark stage complete successfully.",4,False,True,
+S03,spark,SPARK_MEMORY_ERROR,Driver ran out of memory (GC overhead limit exceeded) after collect() pulled a large result to the driver.,SPARK_MEMORY_ERROR,True,read_log_file > identify_error_type > get_fix_suggestion,SPARK_MEMORY_ERROR,SPARK_MEMORY_ERROR,"26/03/06 16:20:14 INFO SparkContext: Starting job: collect at report_builder.py:88
+26/03/06 16:22:40 INFO DAGScheduler: Job 4 finished: collect at report_builder.py:88, took 146.2 s
+26/03/06 16:22:58 ERROR Utils: Uncaught exception in thread driver-heartbeater
+java.lang.OutOfMemoryError: GC overhead limit exceeded
+    at java.util.Arrays.copyOfRange(Arrays.java:3664)
+    at org.apache.spark.sql.Dataset.collectFromPlan(Dataset.scala:3696)
+Exception in thread ""main"" java.lang.OutOfMemoryError: GC overhead limit exceeded","**Diagnosis**
+
+The log you provided shows the driver thread crashing with:
+
+```
+ERROR Utils: Uncaught exception in thread driver-heartbeater
+java.lang.OutOfMemoryError: GC overhead limit exceeded
+    at java.util.Arrays.copyOfRange(...)
+    at org.apache.spark.sql.Dataset.collectFromPlan(Dataset.scala:3696)
+Exception in thread ""main"" java.lang.OutOfMemoryError: GC overhead limit exceeded
+```
+
+This is a classic **Spark driver memory exhaustion** (`SPARK_MEMORY_ERROR`). The `collect()` call at `report_builder.py:88` forces the entire result set to be brought into the driver’s JVM, and the driver’s heap (including overhead) ran out of space, causing the GC‑overhead‑limit error.
+
+**Root cause**
+
+- The driver does not have enough heap (or off‑heap) memory to hold the data returned by `collect()`.
+- Using `collect()` on a large DataFrame amplifies the problem; the driver must allocate memory for every row, and the GC spends >98 % of time trying to free memory, triggering the “GC overhead limit exceeded” safeguard.
+
+**Fix steps (from the knowledge base)**
+
+1. **Avoid `collect()` on large datasets**  
+   - Process data in Spark (e.g., write to Parquet/Delta, aggregate, or use `foreachPartition`) instead of pulling everything to the driver.  
+   - If you only need a sample, use `limit(N).collect()` or `take(N)`.
+
+2. **Increase driver memory**  
+   ```bash
+   spark-submit \
+     --driver-memory 8g \          # or larger, depending on data size
+     --conf spark.driver.memoryOverhead=2g \
+     ...
+   ```
+   - Adjust `spark.driver.memory` and `spark.driver.memoryOverhead` in `spark-defaults.conf` or via the submit command.
+
+3. **Tune Spark memory settings**  
+   - Enable off‑heap storage if you have enough RAM:  
+     ```bash
+     --conf spark.memory.offHeap.enabled=true \
+     --conf spark.memory.offHeap.size=4g
+     ```
+   - Increase the unified memory fraction if needed: `spark.memory.fraction=0.8`.
+
+4. **Reduce data size before collecting**  
+   - Repartition or coalesce to a reasonable number of partitions to limit per‑task memory pressure.  
+   - Drop unnecessary columns, filter early, or aggregate before `collect()`.
+
+5. **Check for data skew** (less likely here but good practice)  
+   - If a join or aggregation is involved before the `collect()`, ensure keys are not heavily skewed; use salting or broadcast joins where appropriate.
+
+6. **Monitor GC and memory usage**  
+   - Enable Spark UI metrics or add `--conf spark.eventLog.enabled=true` and review the driver’s GC logs to confirm the fix.
+
+**Quick actionable change**
+
+If you must keep the `collect()` for a downstream Python step, start by bumping the driver memory:
+
+```bash
+spark-submit \
+  --driver-memory 8g \
+  --conf spark.driver.memoryOverhead=2g \
+  your_job.py
+```
+
+Then refactor the code to avoid pulling the full dataset into the driver whenever possible. This will both solve the immediate OOM and make the pipeline more scalable.",4,False,True,
+S04,spark,SPARK_NULL_ERROR,"Null email value reached a Python UDF (NoneType has no attribute strip), causing a NullPointerException.",SPARK_NULL_ERROR,True,read_log_file > identify_error_type > get_fix_suggestion,SPARK_NULL_ERROR,SPARK_NULL_ERROR,"org.apache.spark.api.python.PythonException: Traceback (most recent call last):
+  File ""/jobs/clean_customers.py"", line 31, in normalise_email
+    return email.strip().lower()
+AttributeError: 'NoneType' object has no attribute 'strip'
+Caused by: java.lang.NullPointerException","**Diagnosis**
+
+The log shows a **Spark task failure** caused by a `PythonException` that bubbles up to a `java.lang.NullPointerException`:
+
+```
+org.apache.spark.api.python.PythonException:
+  File ""/jobs/clean_customers.py"", line 31, in normalise_email
+    return email.strip().lower()
+AttributeError: 'NoneType' object has no attribute 'strip'
+Caused by: java.lang.NullPointerException
+```
+
+- The UDF `normalise_email` is called on a column that contains **null values**.
+- When Spark passes a `null` (represented as `None` in Python) to the UDF, the code tries to call `.strip()` on it, raising an `AttributeError`. Spark then wraps this as a `NullPointerException`, causing the task to be lost.
+
+**Root cause**: Missing null‑handling in a Python UDF used in a Spark DataFrame transformation.
+
+**Fix steps** (from the detailed suggestion for `SPARK_NULL_ERROR`)
+
+1. **Guard against nulls before the UDF**  
+   ```python
+   from pyspark.sql.functions import col
+
+   df = df.filter(col(""email"").isNotNull())
+   # or, if you want to keep rows but replace nulls:
+   df = df.withColumn(""email"", coalesce(col(""email""), lit("""")))
+   ```
+
+2. **Make the UDF null‑safe**  
+   ```python
+   from pyspark.sql.functions import udf
+   from pyspark.sql.types import StringType
+
+   @udf(returnType=StringType())
+   def normalise_email(email):
+       if email is None:
+           return None          # or return a default like """"
+       return email.strip().lower()
+   ```
+
+3. **Validate schema at ingestion**  
+   - When reading the source (CSV, JSON, etc.), specify `nullValue` handling and enforce the expected schema so that unexpected nulls are caught early.
+
+4. **Optional: Use built‑in Spark functions** (often faster and null‑safe)  
+   ```python
+   from pyspark.sql.functions import lower, trim
+
+   df = df.withColumn(""email"", lower(trim(col(""email""))))
+   ```
+
+5. **Re‑run the job** after applying the above changes; the NullPointerException should disappear and the task will complete successfully.",4,False,True,
+S05,spark,SPARK_NULL_ERROR,"NullPointerException in OrderEnricher.scala line 42, a null value not handled in the transformation.",SPARK_NULL_ERROR,True,read_log_file > identify_error_type > get_fix_suggestion,SPARK_NULL_ERROR,SPARK_NULL_ERROR,"26/03/11 08:15:44 ERROR Executor: Exception in task 0.0 in stage 5.0 (TID 61)
+java.lang.NullPointerException
+    at com.acme.etl.OrderEnricher$.$anonfun$enrich$1(OrderEnricher.scala:42)
+    at scala.collection.Iterator$$anon$10.next(Iterator.scala:461)
+    at org.apache.spark.sql.execution.WholeStageCodegenExec.$anonfun$doExecute$4(WholeStageCodegenExec.scala:759)
+26/03/11 08:15:44 WARN TaskSetManager: Lost task 0.0 in stage 5.0 (TID 61) (worker-3 executor 1): java.lang.NullPointerException","**Diagnosis**
+
+The log shows a **`java.lang.NullPointerException`** thrown from your Scala code:
+
+```
+Exception in task 0.0 in stage 5.0 (TID 61)
+java.lang.NullPointerException
+    at com.acme.etl.OrderEnricher$.$anonfun$enrich$1(OrderEnricher.scala:42)
+    at scala.collection.Iterator$$anon$10.next(Iterator.scala:461)
+    at org.apache.spark.sql.execution.WholeStageCodegenExec.$anonfun$doExecute$4(...)
+```
+
+The error type is classified as **`SPARK_NULL_ERROR`** – a NullPointerException occurring during a Spark transformation, most likely because a column value (or an object used inside the `enrich` function) is `null` and the code does not guard against it.
+
+**Root cause**
+
+- In `OrderEnricher.scala` line 42, the code accesses a field/value without checking for `null`.  
+- When Spark processes a partition, it encounters a row where that field is `null`, causing the task to fail and the executor to report the NPE.
+
+**Fix steps**
+
+1. **Add explicit null handling before the risky operation**  
+   ```scala
+   // Example: if you need column ""customer_id""
+   val safeDf = df.filter(col(""customer_id"").isNotNull)
+   // or provide a default
+   val safeDf = df.withColumn(""customer_id"",
+                              coalesce(col(""customer_id""), lit(""UNKNOWN"")))
+   ```
+
+2. **Guard the logic inside `enrich`**  
+   ```scala
+   // Inside OrderEnricher.enrich
+   val enriched = row => {
+     try {
+       // original logic that may hit a null
+       ...
+     } catch {
+       case _: NullPointerException => 
+         // handle gracefully, e.g., return a default or skip
+         defaultEnrichedRow
+     }
+   }
+   ```
+
+3. **Validate schema at ingestion**  
+   - When reading the source (CSV, JSON, Parquet, etc.), enforce a schema that marks required fields as non‑nullable.  
+   - Use `spark.read.schema(mySchema).option(""mode"",""FAILFAST"")` to reject bad rows early.
+
+4. **If you are using a UDF**, make it null‑safe:  
+   ```scala
+   val safeUdf = udf((value: String) => Option(value).map(...).orNull)
+   ```
+
+5. **Re‑run the job** after applying the above changes.  
+   - Monitor the Spark UI for any remaining failed tasks.  
+   - If the job still fails, add additional logging around line 42 to pinpoint which column/value is null.
+
+**Summary**
+
+The pipeline failed because a `NullPointerException` was thrown in `OrderEnricher.scala:42` due to missing null checks on a DataFrame column (or object). Add null filtering/coalescing, make the enrichment logic null‑safe, and validate the input schema to prevent the NPE. Once these safeguards are in place, the Spark job should complete without task loss.",4,False,True,
+S06,spark,SPARK_TASK_ERROR,A corrupt or non Parquet file (part-00014.parquet) in the input path made the task fail 4 times and abort the job.,SPARK_TASK_ERROR,True,read_log_file > identify_error_type > read_log_file > identify_error_type > identify_error_type > identify_error_type > get_fix_suggestion,UNKNOWN_ERROR; UNKNOWN_ERROR; UNKNOWN_ERROR; SPARK_TASK_ERROR,SPARK_TASK_ERROR,"java.io.IOException: Could not read footer for file: s3a://acme-raw/events/date=2026-03-12/part-00014.parquet
+Caused by: java.lang.RuntimeException: s3a://acme-raw/events/date=2026-03-12/part-00014.parquet is not a Parquet file. Expected magic number at tail, but found [12, 0, 0, 0] ||| Spark Parquet file corruption: java.io.IOException: Could not read footer for file: s3a://acme-raw/events/date=2026-03-12/part-00014.parquet
+Caused by: java.lang.RuntimeException: ... is not a Parquet file. Expected magic number at tail ||| Parquet file read error: Could not read footer for file, not a Parquet file, expected magic number ||| 26/03/13 22:40:09 ERROR Executor: Exception in task 14.3 in stage 2.0 (TID 88)
+java.io.IOException: Could not read footer for file: s3a://acme-raw/events/date=2026-03-12/part-00014.parquet
+    at org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat$.readParquetFootersInParallel(ParquetFileFormat.scala:458)
+Caused by: java.lang.RuntimeException: s3a://acme-raw/events/date=2026-03-12/part-00014.parquet is not a Parquet file. Expected magic number at tail, but found [12, 0, 0, 0]
+26/03/13 22:40:10 ERROR TaskSetManager: Task 14 in stage 2.0 failed 4 times; aborting job
+org.apache.spark.SparkException: Job aborted due to stage failure: Task 14 in stage 2.0 failed 4 times, most recent failure: Lost task 14.3 in stage 2.0 (TID 88): java.io.IOException: Could not read footer for file","**Root‑cause (from the log)**  
+
+```
+java.io.IOException: Could not read footer for file: s3a://acme-raw/events/date=2026-03-12/part-00014.parquet
+...
+Caused by: java.lang.RuntimeException: s3a://acme-raw/events/date=2026-03-12/part-00014.parquet is **not a Parquet file**. Expected magic number at tail, but found [12, 0, 0, 0]
+```
+
+Spark tried to read the Parquet footer of `part‑00014.parquet` and failed because the file does **not contain a valid Parquet magic number**. In other words, the file is corrupted (or was never a Parquet file at all). The task retried four times and then the whole stage was aborted:
+
+```
+Task 14 in stage 2.0 failed 4 times, aborting job
+org.apache.spark.SparkException: Job aborted due to stage failure
+```
+
+---
+
+## How to fix it
+
+| Step | What to do | Why it helps |
+|------|------------|--------------|
+| **1. Verify the offending file on S3** | ```aws s3 ls s3://acme-raw/events/date=2026-03-12/part-00014.parquet``` and ```aws s3 cp … - | head -c 4``` (or download and run `hexdump -C`). | Confirms whether the file truly lacks the Parquet magic bytes (`PAR1`). |
+| **2. Identify why the file is bad** | *Common reasons*:<br>• Incomplete upload (multipart upload not finished)<br>• Over‑written by a non‑Parquet producer (e.g., CSV writer)<br>• Disk/EBS corruption during write | Knowing the origin tells you whether you need to re‑run the upstream job, fix a producer bug, or clean up a stray file. |
+| **3. Remove or replace the corrupted file** | ```aws s3 rm s3://acme-raw/events/date=2026-03-12/part-00014.parquet```<br>or replace it with a correct Parquet file generated from the source data. | Spark will no longer try to read a bad footer, so the stage can complete. |
+| **4. Re‑run the downstream Spark job** | After the bad file is gone, trigger the Airflow/DAG run again (or `spark-submit`). | The job will read only valid Parquet parts and finish successfully. |
+| **5. Add defensive handling (optional but recommended)** | • **Skip corrupt files**: `spark.conf.set(""spark.sql.files.ignoreCorruptFiles"", ""true"")`<br>• **Validate on write**: enable `spark.sql.parquet.enableVectorizedReader` = `false` temporarily to surface write‑time errors, and add checksum verification in the producer pipeline.<br>• **Guard against wrong file types**: enforce a naming convention or a pre‑write check that the output format is Parquet. | Prevents a single bad file from breaking the whole job in the future. |
+| **6. Monitor S3 write jobs** | Add S3 event notifications or checksum verification (e.g., MD5/Etag) after each write, and alert on mismatches. | Early detection of incomplete or wrong‑type uploads. |
+
+---
+
+### TL;DR
+
+- **Cause:** `part-00014.parquet` on S3 is not a valid Parquet file (corrupt footer / wrong magic number). Spark aborts after 4 retries.
+- **Fix:** Delete or replace that file, then re‑run the Spark job. Consider enabling `spark.sql.files.ignoreCorruptFiles` and adding upstream validation/checks to avoid future corrupt‑file incidents.",8,False,True,
+S07,spark,SPARK_TASK_ERROR,Data skew in a join: one task read 38.6 GB of shuffle data against a 190 MB median and failed repeatedly.,SPARK_TASK_ERROR,True,read_log_file > identify_error_type > get_fix_suggestion,SPARK_TASK_ERROR,SPARK_TASK_ERROR,"org.apache.spark.SparkException: Job aborted due to stage failure: Task 17 in stage 4.0 failed 4 times, most recent failure: Lost task 17.3 in stage 4.0 (TID 1290): org.apache.spark.shuffle.FetchFailedException: Too large frame: 2147483657","**Diagnosis**
+
+The log shows a Spark job that was aborted because **Task 17 in stage 4.0 failed 4 times**. The final failure is a `FetchFailedException` with the message **“Too large frame: 2147483657”**. This is a classic symptom of **data skew** during a shuffle (the task tried to fetch a 2 GB+ shuffle block, far larger than the default 2 GB frame size). The warning line just before the abort also highlights the problem:
+
+```
+WARN TaskSetManager: Task 17 in stage 4.0 is still running after 2580 s; 
+      Shuffle read for this task: 38.6 GB (median 190 MB).
+```
+
+One task is trying to read **38.6 GB** of shuffle data while the median task only reads **190 MB** – a clear skew.
+
+**Root cause**
+
+- A small number of keys (or a single key) in the join (`sessions_join.py:57`) are extremely hot, causing one reducer task to receive a massive amount of data.
+- The resulting shuffle block exceeds Spark’s maximum frame size (2 GB), leading to `FetchFailedException: Too large frame`.
+
+**Fix steps**
+
+1. **Identify the skewed key(s)**
+   - Run a quick aggregation on the join columns to see the distribution, e.g.:
+
+   ```python
+   df.groupBy(""join_key"").count().orderBy(col(""count"").desc()).show(20)
+   ```
+
+2. **Mitigate the skew**
+
+   *Option A – Salting (recommended for joins)*
+   ```python
+   from pyspark.sql.functions import concat_ws, rand, floor
+
+   # Add a random salt (e.g., 0‑9) to the skewed side
+   salted_left = left_df.withColumn(
+       ""join_key_salted"",
+       concat_ws(""_"", col(""join_key""), floor(rand() * 10))
+   )
+   # Replicate the right side for each possible salt value
+   salted_right = right_df.crossJoin(
+       spark.range(10).toDF(""salt"")
+   ).withColumn(
+       ""join_key_salted"",
+       concat_ws(""_"", col(""join_key""), col(""salt""))
+   ).drop(""salt"")
+
+   result = salted_left.join(salted_right, ""join_key_salted"")
+   ```
+
+   *Option B – Broadcast the small side (if one side fits in memory)*
+   ```python
+   result = small_df.broadcast().join(large_df, ""join_key"")
+   ```
+
+   *Option C – Increase shuffle partitions*
+   ```python
+   spark.conf.set(""spark.sql.shuffle.partitions"", 800)   # or a higher number
+   ```
+
+3. **Increase the max frame size (temporary workaround)**
+   ```python
+   spark.conf.set(""spark.shuffle.io.maxSize"", ""4g"")   # raise from 2g to 4g
+   ```
+   *Only use this if you cannot immediately fix the skew; it just avoids the immediate fetch failure.*
+
+4. **Tune related settings (optional)**
+   - `spark.sql.autoBroadcastJoinThreshold` – ensure broadcast joins are used when appropriate.
+   - `spark.task.maxFailures` – keep at default (4) but monitor; do not increase to hide real failures.
+   - `spark.sql.shuffle.partitions` – higher partition count reduces per‑task data size.
+
+5. **Validate**
+   - Re‑run the job and watch the stage metrics (`spark.ui` → Stages). No single task should have shuffle read > ~1 GB.
+   - Verify that the job completes without `FetchFailedException`.
+
+**Summary**
+
+The failure is caused by **data skew** in the join, leading to an oversized shuffle block (`Too large frame`). Detect the hot key(s), apply a skew‑mitigation technique (salting, broadcast join, or increase shuffle partitions), and optionally raise the max frame size as a short‑term fix. After these changes the job should finish successfully.",4,False,True,
+A01,airflow,AIRFLOW_DIVISION_ERROR,ZeroDivisionError in compute_conversion_rate: visits was zero.,SPARK_TASK_ERROR,False,read_log_file > identify_error_type > get_fix_suggestion > get_fix_suggestion,SPARK_TASK_ERROR,SPARK_TASK_ERROR,"[2026-03-03, 06:00:14 UTC] {taskinstance.py:2731} ERROR - Task failed with exception
+Traceback (most recent call last):
+  File ""/home/airflow/.local/lib/python3.11/site-packages/airflow/operators/python.py"", line 235, in execute
+    return_value = self.execute_callable()
+  File ""/opt/airflow/dags/daily_kpis.py"", line 61, in compute_conversion_rate
+    rate = orders / visits
+ZeroDivisionError: division by zero","**Diagnosis**
+
+The Airflow task **`compute_conversion_rate`** in the DAG **`daily_kpis`** failed with a classic Python `ZeroDivisionError`:
+
+```
+[2026-03-03, 06:00:14 UTC] {taskinstance.py:2731} ERROR - Task failed with exception
+Traceback (most recent call last):
+  File ""/home/airflow/.local/lib/python3.11/site-packages/airflow/operators/python.py"", line 235, in execute
+    return_value = self.execute_callable()
+  File ""/opt/airflow/dags/daily_kpis.py"", line 61, in compute_conversion_rate
+    rate = orders / visits
+ZeroDivisionError: division by zero
+```
+
+- **Root cause:** The variable `visits` is `0` (or `None` that evaluates to `0`) at runtime, so the expression `orders / visits` attempts to divide by zero, which Python does not allow.
+- **Impact:** The task is marked **FAILED** and the DAG run stops (or proceeds to downstream tasks depending on your dependency configuration).
+
+---
+
+**Fix Recommendations**
+
+1. **Guard Against Zero Visits**
+   ```python
+   def compute_conversion_rate(**context):
+       orders = context['ti'].xcom_pull(key='orders')
+       visits = context['ti'].xcom_pull(key='visits')
+
+       # Defensive check
+       if not visits:
+           # Option A: Return a sentinel value (e.g., 0) and log a warning
+           logging.warning(""Visits count is zero or missing; conversion rate set to 0."")
+           return 0.0
+
+           # Option B: Raise a custom AirflowSkipException to skip downstream logic
+           # raise AirflowSkipException(""No visits recorded for this period."")
+       
+       rate = orders / visits
+       return rate
+   ```
+
+2. **Validate Input Data Earlier in the Pipeline**
+   - Add a **pre‑validation task** (e.g., a `PythonOperator` or `BranchPythonOperator`) that checks the upstream data source for non‑zero `visits`.  
+   - If the validation fails, you can either:
+     - **Skip** the conversion‑rate task (`AirflowSkipException`), or  
+     - **Fail fast** with a clear error message that points to the data source problem.
+
+3. **Provide a Default or Fallback**
+   - If a zero‑visit day is expected (e.g., a holiday), decide on a business‑logic fallback:
+     ```python
+     rate = orders / visits if visits else 0.0   # or math.nan, or a predefined constant
+     ```
+
+4. **Add Monitoring / Alerting**
+   - Emit a custom metric (e.g., via StatsD, Prometheus, or Airflow’s built‑in metrics) when `visits == 0` so you can spot data‑quality issues early.
+   - Optionally, configure an **Airflow SLA** or **email alert** on this task to notify the data‑engineering team.
+
+5. **Unit‑test the Function**
+   - Write tests that cover:
+     - Normal case (`visits > 0`)
+     - Edge case (`visits == 0`)
+     - Missing/`None` values
+   - Example with `pytest`:
+     ```python
+     def test_compute_conversion_rate_zero_visits():
+         with pytest.raises(ZeroDivisionError):
+             compute_conversion_rate(orders=100, visits=0)
+     ```
+
+6. **Optional: Use `try/except` for Graceful Degradation**
+   ```python
+   try:
+       rate = orders / visits
+   except ZeroDivisionError:
+       logging.error(""Division by zero in compute_conversion_rate; setting rate to 0."")
+       rate = 0.0
+   ```
+
+---
+
+**Next Steps for You**
+
+1. Open `daily_kpis.py` and locate the `compute_conversion_rate` function (line 61 in the log).  
+2. Implement one of the guard patterns above (preferably the explicit `if not visits:` check).  
+3. Deploy the updated DAG and run a test execution (e.g., via the Airflow UI “Trigger DAG”).  
+4. Verify that the task now either succeeds with a sensible fallback value or is intentionally skipped, and that downstream tasks behave as expected.  
+
+By handling the zero‑division scenario explicitly, you eliminate the uncaught exception, keep the DAG run stable, and gain visibility into data‑quality issues that caused `visits` to be zero.",5,False,False,
+A02,airflow,AIRFLOW_DIVISION_ERROR,ZeroDivisionError (float division by zero) in calculate_margin: revenue was zero.,SPARK_TASK_ERROR,False,read_log_file > identify_error_type,SPARK_TASK_ERROR,SPARK_TASK_ERROR,"[2026-03-05, 02:30:41 UTC] {taskinstance.py:2731} ERROR - Task failed with exception
+Traceback (most recent call last):
+  File ""/home/airflow/.local/lib/python3.11/site-packages/airflow/operators/python.py"", line 235, in execute
+    return_value = self.execute_callable()
+  File ""/opt/airflow/dags/margin_report.py"", line 88, in calculate_margin
+    margin = (revenue - cost) / revenue
+ZeroDivisionError: float division by zero
+[2026-03-05, 02:30:41 UTC] {taskinstance.py:1149} INFO - Marking task as UP_FOR_RETRY. dag_id=margin_report, task_id=calculate_margin","**Diagnosis**
+
+The log you provided is from an Airflow task (`margin_report.calculate_margin`) that failed with a Python `ZeroDivisionError`:
+
+```
+Traceback (most recent call last):
+  File ""/home/airflow/.local/lib/python3.11/site-packages/airflow/operators/python.py"", line 235, in execute
+    return_value = self.execute_callable()
+  File ""/opt/airflow/dags/margin_report.py"", line 88, in calculate_margin
+    margin = (revenue - cost) / revenue
+ZeroDivisionError: float division by zero
+```
+
+The error occurs because the variable `revenue` is **zero** (or `None` that evaluates to zero) at runtime, and the code attempts to divide by it. Airflow then marks the task **UP_FOR_RETRY**, but the underlying bug will cause the same failure on every retry unless the code is changed.
+
+---
+
+**Root Cause**
+
+- **Data issue**: The upstream step that supplies `revenue` (and `cost`) produced a record where `revenue == 0`.  
+- **Logic issue**: The calculation `margin = (revenue - cost) / revenue` does not guard against a zero denominator.
+
+---
+
+**Fix Steps**
+
+1. **Add defensive programming around the division**  
+   ```python
+   def calculate_margin(**context):
+       revenue = context[""ti""].xcom_pull(key=""revenue"")
+       cost    = context[""ti""].xcom_pull(key=""cost"")
+
+       # Guard against zero (or missing) revenue
+       if not revenue:
+           # Choose an appropriate fallback:
+           #   • Skip the calculation and log a warning
+           #   • Set margin to 0 or None
+           #   • Raise a custom exception to fail fast
+           logging.warning(""Revenue is zero or missing; cannot compute margin."")
+           margin = None   # or 0.0, depending on business rules
+       else:
+           margin = (revenue - cost) / revenue
+
+       # Push the result downstream if needed
+       context[""ti""].xcom_push(key=""margin"", value=margin)
+   ```
+
+2. **Validate upstream data**  
+   - If `revenue` comes from a database, API, or another task, add a validation step **before** `calculate_margin` to ensure `revenue > 0`.  
+   - Example validation task:
+     ```python
+     def validate_revenue(**context):
+         revenue = context[""ti""].xcom_pull(key=""revenue"")
+         if revenue is None or revenue <= 0:
+             raise ValueError(f""Invalid revenue value: {revenue}"")
+     ```
+
+3. **Update the DAG dependencies**  
+   - Insert the validation task before `calculate_margin` and set `calculate_margin` to depend on it:
+     ```python
+     validate_rev >> calculate_margin
+     ```
+
+4. **Handle retries sensibly**  
+   - Since the failure is deterministic (division by zero), you probably **don’t want Airflow to retry**.  
+   - Set `retries=0` for this task or use `retry_exponential_backoff=False` and `max_retry_delay=0` to avoid unnecessary retries.
+
+5. **Add monitoring / alerts**  
+   - Emit a custom metric or send an alert when `revenue` is zero so data owners can investigate the upstream source.
+
+6. **Test the change**  
+   - Write a unit test covering the zero‑revenue case:
+     ```python
+     def test_calculate_margin_zero_revenue():
+         with pytest.raises(ValueError):
+             calculate_margin(revenue=0, cost=100)
+     ```
+
+---
+
+**Summary**
+
+- **Cause**: `ZeroDivisionError` because `revenue` is zero when the margin calculation runs.  
+- **Fix**: Guard against zero (or missing) revenue, add upstream validation, adjust DAG dependencies, and disable unnecessary retries. Implement the defensive code shown above, test it, and redeploy the DAG. Once the guard is in place, the task will no longer crash, and you’ll have clearer visibility into data quality issues.",3,False,False,
+A03,airflow,AIRFLOW_TASK_ERROR,load_fact_sales did not run because one upstream extract task failed (trigger rule all_success).,AIRFLOW_TASK_ERROR,True,read_log_file > identify_error_type > get_fix_suggestion,AIRFLOW_TASK_ERROR,AIRFLOW_TASK_ERROR,"[2026-03-07, 05:00:03 UTC] {taskinstance.py:1157} INFO - Dependencies not met for <TaskInstance: warehouse_load.load_fact_sales scheduled__2026-03-06T05:00:00+00:00 [None]>, dependency 'Trigger Rule' FAILED: Task's trigger rule 'all_success' requires all upstream tasks to have succeeded, but found 1 non-success(es). upstream_states=_UpstreamTIStates(success=2, skipped=0, failed=1, upstream_failed=0, removed=0, done=3), upstream_task_ids={'extract_sales', 'extract_stores', 'extract_products'}
+[2026-03-07, 05:00:03 UTC] {taskinstance.py:1157} INFO - Marking task as UPSTREAM_FAILED. dag_id=warehouse_load, task_id=load_fact_sales","**Diagnosis**
+
+The log shows that the **`load_fact_sales`** task in the **`warehouse_load`** DAG was **blocked by its trigger rule**:
+
+```
+dependency 'Trigger Rule' FAILED: Task's trigger rule 'all_success' requires all upstream tasks to have succeeded, but found 1 non‑success(es).
+upstream_states = success=2, failed=1, done=3
+upstream_task_ids = {'extract_sales', 'extract_stores', 'extract_products'}
+```
+
+Because **`extract_sales`** (or one of the other upstream tasks) failed, Airflow marked `load_fact_sales` as **`UPSTREAM_FAILED`** and did not even attempt to run it.
+
+**Root cause**
+
+- An upstream task (`extract_sales`, `extract_stores`, or `extract_products`) did not finish successfully.
+- The downstream task uses the default trigger rule **`all_success`**, which requires every upstream task to succeed before it can run.
+
+**Fix steps**
+
+1. **Inspect the failing upstream task**  
+   - Open the Airflow UI → **DAG → `warehouse_load` → `extract_sales` (or the other failing task)**.  
+   - View its log to see the actual exception (e.g., Spark job error, DB connection timeout, etc.).  
+   - Resolve that underlying issue (e.g., fix a broken JDBC URL, correct a Spark job configuration, address data‑skew, etc.).
+
+2. **Add resilience if occasional upstream failures are acceptable**  
+   - If the downstream task can still run when a particular upstream task is skipped or fails, change its trigger rule, e.g.:
+
+   ```python
+   load_fact_sales = PythonOperator(
+       task_id='load_fact_sales',
+       python_callable=load_fact_sales,
+       trigger_rule='all_done',   # or 'one_success' / 'none_failed'
+       retries=3,
+       retry_delay=timedelta(minutes=5),
+       dag=dag,
+   )
+   ```
+
+   - Choose `all_done` if you want the task to run regardless of upstream status, or `one_success` if at least one upstream must succeed.
+
+3. **Add retries to the upstream task(s)**  
+   - In the DAG definition, give the flaky upstream tasks retry parameters:
+
+   ```python
+   extract_sales = BashOperator(
+       task_id='extract_sales',
+       bash_command='python extract_sales.py',
+       retries=3,
+       retry_delay=timedelta(minutes=5),
+   )
+   ```
+
+4. **Implement alerting / monitoring**  
+   - Set up email or Slack alerts on task failure so you can react quickly to the root cause.  
+   - Consider using Airflow’s `on_failure_callback` to trigger a custom remediation script.
+
+5. **Validate the DAG after changes**  
+   - Run `airflow dags test warehouse_load <execution_date>` to ensure the trigger rule and retries behave as expected.  
+   - Check the UI for the new run; all tasks should now either succeed or follow the new trigger logic.
+
+**Summary**
+
+The failure is an **Airflow upstream‑dependency error** caused by one of the three upstream extraction tasks failing. Fix the underlying upstream error, and/or adjust the downstream task’s trigger rule and add retries to make the pipeline more robust.",4,False,True,
+A04,airflow,AIRFLOW_TASK_ERROR,Airflow task could not connect to the Postgres warehouse (connection timed out on port 5432).,SPARK_TASK_ERROR,False,read_log_file > identify_error_type > identify_error_type > get_fix_suggestion > identify_error_type,SPARK_TASK_ERROR; UNKNOWN_ERROR; UNKNOWN_ERROR,UNKNOWN_ERROR,"[2026-03-10, 01:15:22 UTC] {base.py:83} INFO - Using connection ID 'warehouse_postgres' for task execution.
+[2026-03-10, 01:15:52 UTC] {taskinstance.py:2731} ERROR - Task failed with exception
+Traceback (most recent call last):
+  File ""/home/airflow/.local/lib/python3.11/site-packages/airflow/providers/postgres/hooks/postgres.py"", line 159, in get_conn
+    self.conn = psycopg2.connect(**conn_args)
+psycopg2.OperationalError: connection to server at ""warehouse-db.internal"" (10.0.4.21), port 5432 failed: Connection timed out
+	Is the server running on that host and accepting TCP/IP connections?
+[2026-03-10, 01:15:52 UTC] {taskinstance.py:1149} INFO - Marking task as FAILED. dag_id=nightly_load, task_id=load_orders ||| psycopg2.OperationalError: connection to server at ""warehouse-db.internal"" (10.0.4.21), port 5432 failed: Connection timed out ||| psycopg2.OperationalError: connection to server at ""warehouse-db.internal"" (10.0.4.21), port 5432 failed: Connection timed out","**Root‑cause (from the log)**  
+
+```
+psycopg2.OperationalError: connection to server at ""warehouse-db.internal"" (10.0.4.21), port 5432 failed: Connection timed out
+    Is the server running on that host and accepting TCP/IP connections?
+```
+
+The Airflow task **`load_orders`** (in DAG `nightly_load`) tried to open a PostgreSQL connection using the Airflow connection **`warehouse_postgres`**. The underlying `psycopg2.connect()` call timed‑out, meaning the Airflow worker could not reach the database host at all.
+
+Typical reasons for this exact error are:
+
+| Category | What to check | Why it matters |
+|----------|---------------|----------------|
+| **Network reachability** | - `ping warehouse-db.internal` (or the IP 10.0.4.21) from the Airflow worker node.<br>- `nc -zvw5 10.0.4.21 5432` or `telnet 10.0.4.21 5432` | Confirms the host is reachable and the TCP port is open. |
+| **DNS resolution** | - Verify that `warehouse-db.internal` resolves to the correct IP (`10.0.4.21`).<br>- Check `/etc/resolv.conf` or the internal DNS service. | A wrong or missing DNS entry will cause the client to try the wrong address. |
+| **PostgreSQL service** | - Log into the DB host and run `systemctl status postgresql` (or the appropriate service manager).<br>- Confirm the DB is listening on `0.0.0.0:5432` or the expected interface (`netstat -tnlp | grep 5432`). | If the DB is stopped or bound only to localhost, remote connections will fail. |
+| **Firewall / Security groups** | - In cloud environments, check security‑group rules / network ACLs that allow inbound traffic on 5432 from the Airflow subnet.<br>- On‑prem, verify iptables or host‑based firewalls. | A blocked port will manifest as a timeout. |
+| **Airflow connection definition** | - In the Airflow UI → **Admin → Connections**, open `warehouse_postgres` and verify:<br>  • Host = `warehouse-db.internal` (or the correct IP)<br>  • Port = `5432`<br>  • Username / password are correct<br>  • Extra JSON does not contain a wrong `sslmode` or other params that could cause a silent drop. | Mis‑typed host, port, or credentials will also cause a timeout or immediate auth error. |
+| **Network policies / Service mesh** | - If you use a service mesh (Istio, Linkerd) or a Kubernetes NetworkPolicy, ensure traffic from the Airflow pod to the DB service is allowed. | Policies can silently drop packets, appearing as a timeout. |
+| **Connection timeout settings** | - The default `psycopg2` timeout is ~30 s. If the DB is reachable but very slow, you may need to increase `connect_timeout` in the Airflow connection’s **Extra** field (e.g. `{""connect_timeout"": 60}`). | Helps differentiate “slow response” from “no route”. |
+
+---
+
+## Fix steps (ordered by likelihood)
+
+1. **Validate basic connectivity**  
+   ```bash
+   # From the Airflow worker (or the pod/container running the task)
+   ping -c 3 warehouse-db.internal
+   nc -zvw5 10.0.4.21 5432   # or telnet 10.0.4.21 5432
+   ```
+   *If either command fails, the problem is network‑level.*
+
+2. **Check DNS**  
+   ```bash
+   nslookup warehouse-db.internal
+   dig +short warehouse-db.internal
+   ```
+   *If the name does not resolve to `10.0.4.21`, correct the DNS entry or replace the host with the IP in the Airflow connection.*
+
+3. **Inspect the PostgreSQL server** (run on the DB host)  
+   ```bash
+   sudo systemctl status postgresql
+   sudo netstat -tnlp | grep 5432
+   ```
+   *Make sure the service is up and listening on the external interface (`0.0.0.0` or the specific IP).*
+
+4. **Review firewall / security‑group rules**  
+   - **Cloud**: In AWS, check the SG attached to the DB instance allows inbound 5432 from the Airflow security group/subnet.  
+   - **On‑prem**: `iptables -L -n` or `firewalld` rules.  
+   *Open the port if it is blocked.*
+
+5. **Confirm Airflow connection details**  
+   - Open **Admin → Connections → warehouse_postgres**.  
+   - Verify **Host**, **Port**, **Login**, **Password**, and any **Extra** JSON (e.g., `{""sslmode"":""require""}`).  
+   - Click **Test** (if the UI version supports it) or run a quick Python snippet from the worker:
+     ```python
+     from airflow.providers.postgres.hooks.postgres import PostgresHook
+     hook = PostgresHook(postgres_conn_id='warehouse_postgres')
+     hook.get_conn()   # should succeed or raise a clearer error
+     ```
+
+6. **If the DB is up but still timing out**  
+   - Add a larger timeout to the connection: edit the **Extra** field to include `""connect_timeout"": 60` (or higher).  
+   - Example JSON: `{""connect_timeout"": 60, ""sslmode"": ""require""}`.
+
+7. **Check for service‑mesh or Kubernetes NetworkPolicy** (if Airflow runs in K8s)  
+   - `kubectl get networkpolicy` in the namespace.  
+   - Ensure a policy permits egress to `10.0.4.21:5432`.  
+   - If using Istio, verify `DestinationRule` / `VirtualService` allow traffic.
+
+8. **After fixing the root cause, re‑run the task**  
+   ```bash
+   airflow tasks test nightly_load load_orders 2026-03-10
+   ```
+   *Observe the logs; the task should now succeed or, at worst, surface a different error (e.g., authentication).*
+
+---
+
+### TL;DR Summary
+
+- **Cause:** Airflow could not open a TCP connection to the PostgreSQL server (`warehouse-db.internal:5432`). The timeout indicates a network‑level problem (host unreachable, DNS mis‑resolution, firewall block, DB not listening, or wrong Airflow connection config).  
+- **Fix:** Verify network reachability, DNS, DB service status, firewall/security‑group rules, and the Airflow connection definition. Open the port if blocked, correct any DNS or host typo, ensure the DB is listening on the external interface, and optionally increase the `connect_timeout`. Once the connection succeeds, the task will complete normally.",6,False,False,
+A05,airflow,AIRFLOW_TASK_ERROR,KeyError 'email_address' in map_contacts: the expected field is missing from the source data.,SPARK_TASK_ERROR,False,read_log_file > identify_error_type > get_fix_suggestion > identify_error_type > get_fix_suggestion > identify_error_type,SPARK_TASK_ERROR; UNKNOWN_ERROR; AIRFLOW_TASK_ERROR,AIRFLOW_TASK_ERROR,"[2026-03-12, 07:45:09 UTC] {taskinstance.py:2731} ERROR - Task failed with exception
+Traceback (most recent call last):
+  File ""/home/airflow/.local/lib/python3.11/site-packages/airflow/operators/python.py"", line 235, in execute
+    return_value = self.execute_callable()
+  File ""/opt/airflow/dags/crm_sync.py"", line 40, in map_contacts
+    email = contact[""email_address""]
+KeyError: 'email_address'
+[2026-03-12, 07:45:09 UTC] {taskinstance.py:1149} INFO - Marking task as FAILED. dag_id=crm_sync, task_id=map_contacts ||| KeyError: 'email_address' ||| Traceback (most recent call last):
+  File ""/home/airflow/.local/lib/python3.11/site-packages/airflow/operators/python.py"", line 235, in execute
+    return_value = self.execute_callable()
+  File ""/opt/airflow/dags/crm_sync.py"", line 40, in map_contacts
+    email = contact[""email_address""]
+KeyError: 'email_address'","**Diagnosis – what the log tells us**
+
+| Log excerpt | Meaning |
+|------------|---------|
+| `File ""/opt/airflow/dags/crm_sync.py"", line 40, in map_contacts` | The failure occurs inside the `map_contacts` Python callable that is executed by an Airflow `PythonOperator`. |
+| `email = contact[""email_address""]` | The code is trying to read the **`email_address`** key from a dictionary called `contact`. |
+| `KeyError: 'email_address'` | At least one of the `contact` records **does not contain** the `email_address` key, so Python raises a `KeyError`. |
+| `Task failed … dag_id=crm_sync, task_id=map_contacts` | Airflow marks the task as **FAILED** because the exception propagates out of the operator. |
+
+**Root cause**
+
+The upstream data that `map_contacts` processes (likely a list or iterator of contact dictionaries) is **inconsistent** – some records are missing the `email_address` field. This is a classic data‑quality issue, not a Spark or Kafka problem.
+
+---
+
+## How to fix it
+
+Below is a step‑by‑step remediation plan that you can apply directly to the DAG file (`crm_sync.py`) and/or the data‑preparation step that feeds `map_contacts`.
+
+### 1. Add defensive access to the dictionary
+Replace the direct key lookup with a safe pattern:
+
+```python
+def map_contacts(**context):
+    contacts = context[""ti""].xcom_pull(task_ids=""fetch_contacts"")  # example source
+    processed = []
+
+    for contact in contacts:
+        # Option A – use .get() with a default (e.g., empty string or None)
+        email = contact.get(""email_address"")
+        if not email:
+            # Decide what to do with missing emails:
+            #   * skip the record
+            #   * log a warning
+            #   * fill with a placeholder
+            logging.warning(
+                ""Contact %s missing 'email_address' – skipping"",
+                contact.get(""id"", ""<unknown>"")
+            )
+            continue   # or `processed.append({...})` with a placeholder
+
+        # Normal processing continues here
+        processed.append({
+            ""id"": contact.get(""id""),
+            ""email"": email,
+            # … other fields …
+        })
+
+    # Push the cleaned list downstream
+    context[""ti""].xcom_push(key=""clean_contacts"", value=processed)
+```
+
+**Why:** `.get()` returns `None` (or a default you provide) instead of raising an exception, allowing you to decide how to handle the bad record.
+
+### 2. Validate the input data early (upstream task)
+
+If the missing key is unexpected, add a validation step before `map_contacts`:
+
+```python
+def validate_contacts(**context):
+    contacts = context[""ti""].xcom_pull(task_ids=""fetch_contacts"")
+    bad = [c for c in contacts if ""email_address"" not in c]
+
+    if bad:
+        raise ValueError(
+            f""{len(bad)} contacts are missing 'email_address'. ""
+            ""Check source system or add default values.""
+        )
+```
+
+Then set this as a **upstream dependency** (`validate_contacts >> map_contacts`). This makes the failure explicit and easier to debug.
+
+### 3. Clean or enrich the source data
+
+If the source system (e.g., a CRM API, a database dump, or a Kafka topic) can be adjusted:
+
+* **Add a default value** for missing emails (e.g., `email_address = ''`).
+* **Enforce a schema** using tools like **Great Expectations**, **pandera**, or **Airflow’s built‑in `DataQualityOperator`**.
+* **Filter out** records without an email at the source query level (e.g., `WHERE email_address IS NOT NULL`).
+
+### 4. Add logging for observability
+
+Even after fixing the code, it’s good practice to log any anomalies:
+
+```python
+import logging
+logging.info(""Processing %d contacts"", len(contacts))
+logging.warning(""Skipped %d contacts missing email_address"", skipped_count)
+```
+
+This gives you a clear audit trail in the Airflow UI and helps catch regressions.
+
+### 5. Test the change locally / in a staging environment
+
+1. **Unit test** the `map_contacts` function with a mix of good and bad records.
+2. **Run the DAG** in a dev Airflow instance (`airflow dags test crm_sync <execution_date>`).
+3. Verify that the task now **completes successfully** and that the downstream tasks receive the cleaned data.
+
+### 6. Deploy the updated DAG
+
+* Commit the changes to your DAG repository.
+* Deploy to the Airflow workers (e.g., via CI/CD pipeline, Docker image rebuild, or copying the file to the DAG folder).
+* Unpause the DAG and trigger a new run.
+
+---
+
+## TL;DR Summary
+
+- **Cause:** A `KeyError` raised because some `contact` dictionaries lack the `email_address` key.
+- **Fix:** Access the key safely (`contact.get(""email_address"")`), decide how to handle missing values (skip, default, or raise a clear validation error), and optionally add an upstream validation task. Add logging, test, and redeploy.
+
+Implementing the defensive lookup (or upstream validation) will stop the `KeyError`, allow the `map_contacts` task to finish, and make the pipeline more robust against imperfect source data.",7,False,True,
+K01,kafka,KAFKA_ERROR,Consumer offset commit failed because the group rebalanced: processing took longer than max.poll.interval.ms.,KAFKA_ERROR,True,read_log_file > identify_error_type > get_fix_suggestion,KAFKA_ERROR,KAFKA_ERROR,"2026-03-08 13:22:17,904 ERROR [order-consumer-1] o.a.k.c.c.internals.ConsumerCoordinator: [Consumer clientId=order-consumer-1, groupId=order-processors] Offset commit failed on partition orders-3 at offset 88214
+org.apache.kafka.clients.consumer.CommitFailedException: Commit cannot be completed since the group has already rebalanced and assigned the partitions to another member. This means that the time between subsequent calls to poll() was longer than the configured max.poll.interval.ms, which typically implies that the poll loop is spending too much time message processing.
+2026-03-08 13:22:18,011 INFO [order-consumer-1] o.a.k.c.c.internals.ConsumerCoordinator: [Consumer clientId=order-consumer-1, groupId=order-processors] Revoke previously assigned partitions orders-3","**Diagnosis**
+
+The log shows a **Kafka consumer commit failure**:
+
+```
+ERROR ... ConsumerCoordinator: Offset commit failed on partition orders-3 at offset 88214
+org.apache.kafka.clients.consumer.CommitFailedException:
+    Commit cannot be completed since the group has already rebalanced and assigned the partitions to another member.
+    This means that the time between subsequent calls to poll() was longer than the configured max.poll.interval.ms,
+    which typically implies that the poll loop is spending too much time processing messages.
+INFO ... ConsumerCoordinator: Revoke previously assigned partitions orders-3
+```
+
+**Root cause**
+
+- The consumer’s `poll()` loop took longer than `max.poll.interval.ms`.  
+- Because of the long pause, the consumer group performed a **rebalance**, assigning the partition to another member.  
+- When the original consumer later tried to commit its offset, the group no longer owned the partition, so Kafka threw a `CommitFailedException`.
+
+**Fix steps**
+
+1. **Reduce processing time per poll**  
+   - Break large batches into smaller chunks or process records asynchronously.  
+   - Move heavy I/O or CPU‑bound work out of the poll loop (e.g., use a thread pool or Spark job that runs after the poll returns).
+
+2. **Increase `max.poll.interval.ms`** (only if longer processing is expected and acceptable)  
+   ```properties
+   max.poll.interval.ms=300000   # e.g., 5 minutes
+   ```
+   - Restart the consumer after changing the config.
+
+3. **Adjust `max.poll.records`** to limit the number of records returned per poll, keeping processing time within the interval.  
+   ```properties
+   max.poll.records=500   # or a value that fits your processing latency
+   ```
+
+4. **Tune session/heartbeat settings** to avoid premature rebalances:  
+   ```properties
+   session.timeout.ms=30000
+   heartbeat.interval.ms=10000
+   ```
+
+5. **Monitor consumer lag and rebalance events**  
+   - Use `kafka-consumer-groups.sh --describe --group order-processors` to watch lag.  
+   - Enable `log4j.logger.org.apache.kafka.clients.consumer.internals=DEBUG` to see detailed rebalance logs.
+
+6. **If the consumer is intentionally long‑running (e.g., batch Spark job)**, consider:
+   - Using **Kafka Streams** or **Spark Structured Streaming** which handle offset commits automatically.  
+   - Or manually committing offsets **after** the long processing finishes, but ensure you call `poll()` frequently enough (e.g., a heartbeat thread).
+
+**Summary**
+
+The failure is due to a **commit after a group rebalance caused by exceeding `max.poll.interval.ms`**. Reduce per‑poll processing time, increase the poll interval, and/or adjust related consumer configs to keep the consumer alive between polls. After applying the changes, restart the consumer and verify that offsets are committed successfully without rebalance‑related errors.",4,False,True,
+K02,kafka,KAFKA_ERROR,"Producer could not reach the Kafka broker at kafka-0.internal:9092, so metadata timed out.",KAFKA_ERROR,True,read_log_file > identify_error_type > get_fix_suggestion,KAFKA_ERROR,KAFKA_ERROR,"2026-03-11 10:04:51,330 WARN [clickstream-producer] org.apache.kafka.clients.NetworkClient: [Producer clientId=clickstream-producer] Connection to node -1 (kafka-0.internal/10.0.2.15:9092) could not be established. Broker may not be available.
+2026-03-11 10:04:52,441 WARN [clickstream-producer] org.apache.kafka.clients.NetworkClient: [Producer clientId=clickstream-producer] Connection to node -1 (kafka-0.internal/10.0.2.15:9092) could not be established. Broker may not be available.
+2026-03-11 10:05:51,335 ERROR [main] com.acme.stream.ClickProducer: Failed to send record
+org.apache.kafka.common.errors.TimeoutException: Topic clickstream not present in metadata after 60000 ms.","**Diagnosis**
+
+The log shows a classic **Kafka broker‑unavailable** situation:
+
+```
+WARN  [clickstream-producer] Connection to node -1 (kafka-0.internal/10.0.2.15:9092) could not be established. Broker may not be available.
+…
+ERROR [main] com.acme.stream.ClickProducer: Failed to send record
+org.apache.kafka.common.errors.TimeoutException: Topic clickstream not present in metadata after 60000 ms.
+```
+
+The producer cannot open a TCP connection to the broker (`kafka-0.internal:9092`). Because the broker is unreachable, the client never receives metadata for the `clickstream` topic, leading to a `TimeoutException`.
+
+**Root cause**
+
+- The Kafka broker at `10.0.2.15:9092` is down, mis‑configured, or blocked by network/firewall rules.
+- Consequently the producer cannot discover the topic metadata and times out after 60 s.
+
+**Fix steps (from the knowledge base)**
+
+1. **Verify broker health & connectivity**  
+   ```bash
+   # From the producer host
+   nc -zv 10.0.2.15 9092          # test TCP reachability
+   kafka-broker-api-versions.sh --bootstrap-server 10.0.2.15:9092
+   ```  
+   - If the connection fails, start the broker service or correct its host/IP.  
+   - Check that the broker’s `listeners` config includes `PLAINTEXT://0.0.0.0:9092` (or the appropriate security protocol).  
+
+2. **Inspect network/firewall**  
+   - Ensure no security group, iptables rule, or cloud‑VPC firewall blocks port 9092 between the producer and the broker.  
+   - If TLS/SASL is used, confirm the correct listener (`SSL://…` or `SASL_SSL://…`) and that the producer’s `bootstrap.servers` matches it.
+
+3. **Confirm the topic exists**  
+   ```bash
+   kafka-topics.sh --bootstrap-server 10.0.2.15:9092 --list | grep clickstream
+   ```  
+   - If the topic is missing, create it (`kafka-topics.sh --create …`).  
+   - If the broker is up but the topic still isn’t visible, there may be a Zookeeper/metadata issue; restart the broker or run a metadata refresh.
+
+4. **Increase client timeout (temporary mitigation)**  
+   - In the producer config, raise `request.timeout.ms` and `metadata.max.age.ms` (e.g., to 120 000 ms) to give the client more time to reconnect after a broker restart.
+
+5. **Restart the producer after broker is reachable**  
+   - Once the broker is confirmed reachable and the topic exists, restart the `clickstream-producer` application so it can fetch fresh metadata.
+
+6. **Monitor**  
+   - Enable `client.id` and `log4j` DEBUG logging for the producer to see detailed retry behavior.  
+   - Set up alerts on broker health (e.g., using Prometheus/JMX) to catch future outages early.
+
+**Summary**
+
+The pipeline failed because the Kafka broker at `10.0.2.15:9092` was unavailable, preventing the producer from obtaining metadata for the `clickstream` topic, which resulted in a `TimeoutException`. Fix the issue by ensuring the broker is running and reachable (network/firewall checks), verify the topic exists, optionally increase client timeouts, and then restart the producer. Once the broker is healthy, the pipeline should resume normal operation.",4,False,True,
+K03,kafka,KAFKA_ERROR,"Committed offset was deleted by 1 day retention while the consumer was stopped for 3 days, and auto.offset.reset=none.",KAFKA_ERROR,True,read_log_file > identify_error_type > get_fix_suggestion,KAFKA_ERROR,KAFKA_ERROR,"2026-03-14 04:30:12,118 INFO [audit-consumer] o.a.k.c.c.internals.Fetcher: [Consumer clientId=audit-consumer, groupId=audit-archiver] Fetch position FetchPosition{offset=1250331} is out of range for partition audit-events-0
+2026-03-14 04:30:12,120 ERROR [audit-consumer] com.acme.audit.Archiver: Consumer failed
+org.apache.kafka.clients.consumer.OffsetOutOfRangeException: Fetch position FetchPosition{offset=1250331, offsetEpoch=Optional.empty} is out of range for partition audit-events-0
+Note: auto.offset.reset=none, topic retention.ms=86400000 (1 day); consumer group was stopped for 3 days.","**Root‑cause analysis**
+
+The log shows a classic **Kafka `OffsetOutOfRangeException`**:
+
+```
+org.apache.kafka.clients.consumer.OffsetOutOfRangeException:
+Fetch position FetchPosition{offset=1250331} is out of range for partition audit-events-0
+Note: auto.offset.reset=none, topic retention.ms=86400000 (1 day);
+consumer group was stopped for 3 days.
+```
+
+* The consumer tried to read offset **1250331**, but that offset no longer exists because the topic’s retention is **1 day** and the consumer group was idle for **3 days**.  
+* `auto.offset.reset=none` tells the consumer **not** to automatically reset to the earliest or latest offset, so the poll fails immediately.
+
+**Fix steps**
+
+1. **Decide the desired reset behavior**  
+   * If you want the consumer to start from the **earliest** available data after a restart, set  
+     ```properties
+     auto.offset.reset=earliest
+     ```  
+   * If you prefer to start from the **latest** (skip missed data), set  
+     ```properties
+     auto.offset.reset=latest
+     ```
+
+2. **Reset the consumer group offsets manually (one‑time fix)**  
+   ```bash
+   # Show current lag / offsets
+   kafka-consumer-groups.sh --bootstrap-server <broker> \
+       --describe --group audit-archiver
+
+   # Reset to earliest (or latest) offset for the affected topic/partition
+   kafka-consumer-groups.sh --bootstrap-server <broker> \
+       --group audit-archiver --topic audit-events \
+       --reset-offsets --to-earliest --execute
+   # or --to-latest if you prefer
+   ```
+
+3. **Adjust topic retention if appropriate**  
+   * If you need to keep data longer than 1 day, increase `retention.ms` (or `retention.bytes`) on the topic:  
+     ```bash
+     kafka-configs.sh --bootstrap-server <broker> \
+         --alter --entity-type topics --entity-name audit-events \
+         --add-config retention.ms=604800000   # 7 days
+     ```
+
+4. **Add monitoring / alerts**  
+   * Set up a metric/alert on consumer lag (`consumer_lag` in Prometheus/JMX) so you’re warned before a group falls behind retention.  
+   * Optionally enable `max.poll.interval.ms` and `session.timeout.ms` values that suit your processing time, but the primary issue is offset loss, not timeout.
+
+5. **Deploy the configuration change**  
+   * Update the consumer application’s config (or the Helm/Env file) with the new `auto.offset.reset` value.  
+   * Restart the consumer so it picks up the new settings.
+
+6. **Verify**  
+   * After restart, run `kafka-consumer-groups.sh --describe --group audit-archiver` again – offsets should now be within the valid range and lag should be zero or acceptable.  
+   * Check the application logs for a successful poll/startup message.
+
+**Summary**
+
+The failure is caused by the consumer trying to read an offset that has already been deleted due to the topic’s 1‑day retention while the consumer group was offline for 3 days, combined with `auto.offset.reset=none`. Reset the group’s offsets (or change `auto.offset.reset` to `earliest`/`latest`), optionally increase topic retention, and add lag monitoring to prevent recurrence.",4,False,True,
+K04,kafka,KAFKA_ERROR,Producer message (2.3 MB) larger than max.request.size (1 MB): RecordTooLargeException.,KAFKA_ERROR,True,read_log_file > identify_error_type > get_fix_suggestion,KAFKA_ERROR,KAFKA_ERROR,"org.apache.kafka.common.errors.RecordTooLargeException: The message is 2311042 bytes when serialized which is larger than 1048576, which is the value of the max.request.size configuration.","**Log excerpt (eval_data/scenarios/K04_kafka_message_too_large.log)**  
+
+```
+2026-03-17 18:11:40,207 ERROR [invoice-producer] com.acme.billing.InvoicePublisher: Failed to publish invoice batch 7731
+org.apache.kafka.common.errors.RecordTooLargeException: The message is 2311042 bytes when serialized which is larger than 1048576, which is the value of the max.request.size configuration.
+2026-03-17 18:11:40,209 WARN [invoice-producer] com.acme.billing.InvoicePublisher: Batch 7731 will be retried in 30 s
+```
+
+### Root cause
+The producer tried to send a **single Kafka record of ~2.3 MB**, but the producer’s `max.request.size` (default 1 MB = 1 048 576 bytes) is smaller. Kafka therefore throws a `RecordTooLargeException` and the batch is retried, causing the pipeline failure.
+
+### Fix – step‑by‑step
+
+| Step | What to do | Why it matters |
+|------|------------|----------------|
+| **1. Verify the size of the payload** | Check the code that builds the invoice batch. If a single invoice (or a batch) can legitimately be >1 MB, you need to either split it into smaller messages or compress it. | Reducing payload size avoids the need to change cluster limits and keeps network usage low. |
+| **2. Increase the producer limit** | In the producer configuration (e.g., `producer.properties` or the `KafkaProducer` builder), raise `max.request.size` to a value larger than the biggest message you expect, e.g.: <br>`max.request.size=5242880` (5 MB) | Allows the producer to send larger records. |
+| **3. Align broker limits** | On each broker, ensure `message.max.bytes` (default 1 MB) is ≥ the new `max.request.size`. Update `server.properties` and restart the broker, e.g.: <br>`message.max.bytes=5242880` | Brokers reject messages larger than this setting, so the broker must accept the larger size. |
+| **4. Align replica fetch limit** (if replication is enabled) | Set `replica.fetch.max.bytes` on the brokers to at least the new max size, e.g.: <br>`replica.fetch.max.bytes=5242880` | Replicas need to fetch the larger records during replication. |
+| **5. (Optional) Enable compression** | Add `compression.type=snappy` (or `lz4`) to the producer config. This can shrink the on‑wire size, often keeping it under the default limits. | Reduces network bandwidth and may keep messages under the existing limits without raising them. |
+| **6. Test the change** | Re‑run the producer (or the whole pipeline) with a small test batch that exceeds the old limit but is below the new limit. Verify that the `RecordTooLargeException` no longer appears. | Confirms the fix works before deploying to production. |
+| **7. Deploy** | Roll out the updated producer config (and broker config if changed) to your environment. Monitor the producer logs for any further retries or new errors. | Ensures the fix is applied consistently across all nodes. |
+
+### Quick checklist for immediate remediation
+1. **Edit producer config** – add/modify `max.request.size=5242880` (or a size that comfortably exceeds 2.3 MB).  
+2. **If you cannot change broker config** (e.g., managed Kafka service), **split the invoice batch** into smaller messages (e.g., <1 MB each) or enable compression.  
+3. Restart the producer (or redeploy the application) and verify that the error disappears.
+
+---
+
+**Bottom line:** The pipeline failed because a Kafka record exceeded the producer’s `max.request.size`. Raise that limit (and the corresponding broker limits) **or** break the payload into smaller chunks/compress it. After applying the change and confirming with a test run, the pipeline should publish invoices without further `RecordTooLargeException` errors.",4,False,True,
+T01,tricky,KAFKA_ERROR,Root cause is Kafka: the Airflow task failed because it could not connect to any Kafka broker.,SPARK_TASK_ERROR,False,read_log_file > identify_error_type > get_fix_suggestion > identify_error_type > get_fix_suggestion,SPARK_TASK_ERROR; KAFKA_ERROR,KAFKA_ERROR,"[2026-03-18, 03:00:07 UTC] {taskinstance.py:2731} ERROR - Task failed with exception
+Traceback (most recent call last):
+  File ""/home/airflow/.local/lib/python3.11/site-packages/airflow/operators/python.py"", line 235, in execute
+    return_value = self.execute_callable()
+  File ""/opt/airflow/dags/publish_events.py"", line 52, in publish_to_kafka
+    producer.flush(timeout=30)
+  File ""/home/airflow/.local/lib/python3.11/site-packages/kafka/producer/kafka.py"", line 657, in flush
+    raise Errors.KafkaTimeoutError(""Timeout after waiting for 30 secs."")
+kafka.errors.KafkaTimeoutError: KafkaTimeoutError: Failed to update metadata after 30.0 secs. NoBrokersAvailable: could not connect to any broker at kafka-0.internal:9092
+[2026-03-18, 03:00:07 UTC] {taskinstance.py:1149} INFO - Marking task as FAILED. dag_id=publish_events, task_id=publish_to_kafka ||| kafka.errors.KafkaTimeoutError: KafkaTimeoutError: Failed to update metadata after 30.0 secs. NoBrokersAvailable: could not connect to any broker at kafka-0.internal:9092","**Root‑cause (from the log)**  
+
+```
+kafka.errors.KafkaTimeoutError: KafkaTimeoutError: Failed to update metadata after 30.0 secs.
+NoBrokersAvailable: could not connect to any broker at kafka-0.internal:9092
+```
+
+The Airflow PythonOperator `publish_to_kafka` called `producer.flush(timeout=30)`.  
+During the flush the Kafka client tried to contact the broker **kafka-0.internal:9092**, could not resolve or reach it, and gave up after 30 seconds. Because the producer could not obtain metadata (i.e., discover the broker), the task raised a `KafkaTimeoutError` and Airflow marked the task **FAILED**.
+
+---
+
+## How to fix it
+
+| Step | What to do | Why it matters |
+|------|------------|----------------|
+| **1. Verify DNS / hostname** | From the Airflow worker/container run `nslookup kafka-0.internal` (or `dig`). | If the name does not resolve, the producer cannot find the broker. Fix the DNS entry or use the correct host/IP. |
+| **2. Test network connectivity** | `telnet kafka-0.internal 9092` or `nc -zv kafka-0.internal 9092`. | Confirms that the TCP port is reachable. If the connection times‑out, check firewall rules, Kubernetes Service/Pod network policies, or Docker bridge settings. |
+| **3. Confirm broker is up** | Log into the Kafka node and run `kafka-broker-api-versions.sh --bootstrap-server localhost:9092`. | If the broker process is down or not listening on 9092, start/restart it and check its own logs for errors. |
+| **4. Check Airflow Kafka client configuration** | In `publish_events.py` verify the `bootstrap_servers` list matches the actual broker address (e.g., `[""kafka-0.internal:9092""]`). | A typo or outdated address will cause the same “NoBrokersAvailable” error. |
+| **5. Review security settings** (if TLS/SASL is used) | Ensure the producer’s `security_protocol`, `ssl_*` or `sasl_*` settings match the broker’s configuration. | Mismatched security settings can make the broker appear unreachable. |
+| **6. Increase timeout / add retries (temporary mitigation)** | ```python\nproducer = KafkaProducer(..., retries=5, request_timeout_ms=60000, metadata_max_age_ms=300000)\n``` | Gives the client more time to reconnect while you investigate the underlying network issue. |
+| **7. Restart the Airflow task / worker** | After fixing DNS/network, clear the failed task in the UI and re‑run it (or restart the worker pod). | Ensures the producer picks up the corrected configuration. |
+| **8. Monitor after fix** | Check the Airflow task logs and Kafka broker logs for successful `metadata update` and `produce` messages. | Confirms the problem is resolved and no new errors appear. |
+
+---
+
+### Quick checklist to run now
+
+```bash
+# 1. DNS
+nslookup kafka-0.internal
+
+# 2. Connectivity
+nc -zv kafka-0.internal 9092   # or telnet
+
+# 3. Broker health (run on broker host)
+kafka-broker-api-versions.sh --bootstrap-server localhost:9092
+```
+
+If any of the above commands fail, address that layer (DNS, firewall, broker process) before re‑running the Airflow DAG.
+
+---
+
+**Bottom line:** The Airflow task failed because the Kafka producer could not reach any broker at `kafka-0.internal:9092`. Fix the hostname/port resolution and network path (or correct the bootstrap server list), then re‑run the task. Once the broker is reachable, the `producer.flush()` call will succeed and the DAG will complete.",6,False,True,
+T02,tricky,SPARK_MEMORY_ERROR,Root cause is Spark memory: the Spark job launched by Airflow had executors killed by YARN for exceeding memory (2g executors).,SPARK_MEMORY_ERROR,True,read_log_file > identify_error_type > get_fix_suggestion,SPARK_MEMORY_ERROR,SPARK_MEMORY_ERROR,"[2026-03-19, 04:31:02 UTC] {spark_submit.py:571} INFO - 26/03/19 04:31:02 ERROR YarnScheduler: Lost executor 3 on node-2: Container killed by YARN for exceeding memory limits. 2.6 GB of 2.5 GB physical memory used.
+[2026-03-19, 04:31:40 UTC] {spark_submit.py:571} INFO - Exception in thread ""main"" org.apache.spark.SparkException: Job aborted due to stage failure: Task 8 in stage 6.0 failed 4 times, most recent failure: ExecutorLostFailure (executor 3 exited caused by one of the running tasks) Reason: Container killed by YARN for exceeding memory limits.
+airflow.exceptions.AirflowException: Cannot execute: spark-submit --master yarn --deploy-mode cluster --executor-memory 2g jobs/build_features.py. Error code is: 1.","**Diagnosis of `eval_data/scenarios/T02_spark_oom_from_airflow.log`**
+
+| Timestamp | Log excerpt | What it tells us |
+|-----------|-------------|------------------|
+| 04:31:02 | `YarnScheduler: Lost executor 3 on node-2: Container killed by YARN for exceeding memory limits. 2.6 GB of 2.5 GB physical memory used.` | The executor was killed because it tried to use **more memory than the YARN container limit** (2.5 GB). |
+| 04:31:40 | `org.apache.spark.SparkException: Job aborted due to stage failure … ExecutorLostFailure … Reason: Container killed by YARN for exceeding memory limits.` | Spark reports a stage failure caused by the same executor‑loss event. |
+| 04:31:41 | `airflow.exceptions.AirflowException: Cannot execute: spark-submit … --executor-memory 2g … Error code is: 1.` | Airflow sees the Spark job exit with a non‑zero status (the OOM kill). |
+
+**Root cause**  
+The Spark job was launched with `--executor-memory 2g`, but the actual physical memory consumption reached **~2.6 GB**, exceeding the YARN container limit (2.5 GB). This triggered an **Out‑Of‑Memory (OOM) kill** of the executor, causing the stage to fail and the Airflow task to error out.
+
+**Fix – step‑by‑step**
+
+1. **Increase executor memory**  
+   - In the `spark-submit` command (or in `spark-defaults.conf`), raise the memory allocation, e.g.:  
+     ```bash
+     spark-submit --master yarn --deploy-mode cluster \
+       --executor-memory 4g \
+       --executor-cores <n> \
+       jobs/build_features.py
+     ```
+   - Adjust `--executor-cores` if you also need more CPU.
+
+2. **Add memory overhead** (YARN container overhead is separate from Spark heap)  
+   - Set `spark.yarn.executor.memoryOverhead` (or `spark.executor.memoryOverhead`) to at least 10‑15 % of the executor memory, e.g.:  
+     ```bash
+     --conf spark.yarn.executor.memoryOverhead=512m
+     ```
+
+3. **Tune Spark memory management** (optional but helpful)  
+   - Enable off‑heap storage if your workload benefits from it:  
+     ```bash
+     --conf spark.memory.offHeap.enabled=true \
+     --conf spark.memory.offHeap.size=2g
+     ```
+   - Adjust `spark.memory.fraction` / `spark.memory.storageFraction` if you suspect too much memory is being used for caching.
+
+4. **Reduce per‑task memory pressure**  
+   - **Repartition** the DataFrame before heavy transformations (e.g., joins, aggregations) to avoid a single task pulling too much data into memory:  
+     ```python
+     df = df.repartition(200, ""key_column"")
+     ```
+   - Consider **persisting** intermediate results with a storage level that spills to disk (`MEMORY_AND_DISK`) if you’re caching large datasets.
+
+5. **Check for data skew**  
+   - If a particular join key is heavily skewed, a single task may receive a disproportionate amount of data, causing OOM.  
+   - Apply **salting** or **broadcast joins** (if the smaller side fits in memory) to mitigate skew.
+
+6. **Update Airflow DAG (if needed)**  
+   - Ensure the DAG’s `SparkSubmitOperator` (or BashOperator) reflects the new memory settings so future runs use the corrected parameters.  
+   - Example snippet:  
+     ```python
+     SparkSubmitOperator(
+         task_id=""build_features"",
+         application=""jobs/build_features.py"",
+         conf={""spark.executor.memory"": ""4g"",
+               ""spark.yarn.executor.memoryOverhead"": ""512m""},
+         ...
+     )
+     ```
+
+**Summary**
+
+The failure was caused by an **executor OOM**: the container exceeded its 2.5 GB limit while the job requested only 2 GB of executor heap. Resolve it by **increasing executor memory and overhead**, optionally **tuning Spark memory settings**, **repartitioning** to lower per‑task memory usage, and **checking for data skew**. After updating the Spark submit arguments (and the Airflow operator if applicable), re‑run the DAG; the job should complete without the YARN kill.",4,False,True,
+O01,out_of_scope,UNKNOWN_ERROR,"Not one of the 6 types: an AWS IAM permission error (role lacks s3:PutObject). The agent should name this, not force a Spark/Airflow/Kafka fix.",UNKNOWN_ERROR,True,read_log_file > identify_error_type > get_fix_suggestion,UNKNOWN_ERROR,UNKNOWN_ERROR,"2026-03-20 09:12:56,027 ERROR export_job: Upload failed for part-0001.csv
+Traceback (most recent call last):
+  File ""/app/export_job.py"", line 74, in upload
+    s3.upload_file(local_path, bucket, key)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the PutObject operation: User: arn:aws:iam::412233:role/etl-runner is not authorized to perform: s3:PutObject on resource: ""arn:aws:s3:::acme-finance-exports/2026-03-20/part-0001.csv"" because no identity-based policy allows the s3:PutObject action","**Root‑cause (from the log)**  
+
+```
+2026-03-20 09:12:56,027 ERROR export_job: Upload failed for part-0001.csv
+...
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the PutObject operation:
+User: arn:aws:iam::412233:role/etl-runner is not authorized to perform: s3:PutObject on resource:
+""arn:aws:s3:::acme-finance-exports/2026-03-20/part-0001.csv""
+because no identity‑based policy allows the s3:PutObject action
+```
+
+The **ETL job’s IAM role (`arn:aws:iam::412233:role/etl-runner`) does not have permission to write objects to the target S3 bucket** (`acme-finance-exports`). The AWS SDK (botocore) therefore raises a `ClientError: AccessDenied` when `s3.upload_file` tries to execute a `PutObject`.
+
+---
+
+## Fix steps
+
+| # | Action | Why it solves the problem | How to do it |
+|---|--------|---------------------------|--------------|
+| 1 | **Add `s3:PutObject` (and optionally `s3:PutObjectAcl`) to the role’s policy** | Grants the role the explicit permission required to write files to the bucket. | 1. Open the IAM console → Roles → `etl-runner`. <br>2. Attach or edit an inline policy such as: <br>```json { ""Version"": ""2012-10-17"", ""Statement"": [ { ""Effect"": ""Allow"", ""Action"": [ ""s3:PutObject"", ""s3:PutObjectAcl"" ], ""Resource"": ""arn:aws:s3:::acme-finance-exports/*"" } ] } ``` |
+| 2 | **Verify the bucket policy does not block the write** | Even if the role has permission, a restrictive bucket policy can deny the action. | 1. Open the S3 console → bucket `acme-finance-exports`. <br>2. Check the bucket policy for a `Deny` on `s3:PutObject` or a condition that excludes the role’s ARN. <br>3. If present, remove the deny or add an explicit `Allow` for the role’s ARN. |
+| 3 | **If the bucket uses SSE‑KMS encryption, add KMS permissions** | `PutObject` on an encrypted bucket also requires `kms:GenerateDataKey` / `kms:Decrypt` on the key. | 1. Identify the KMS key ID used by the bucket (look at bucket → Properties → Default encryption). <br>2. In the role policy, add: <br>```json { ""Effect"": ""Allow"", ""Action"": [ ""kms:GenerateDataKey"", ""kms:Decrypt"" ], ""Resource"": ""arn:aws:kms:region:account-id:key/key-id"" } ``` |
+| 4 | **Test the permission change** | Confirms the fix before re‑running the full job. | Run a small test script: <br>```python import boto3 s3 = boto3.client('s3') s3.upload_file('tmp.txt', 'acme-finance-exports', 'test-access.txt')``` <br>If it succeeds, the permission issue is resolved. |
+| 5 | **Re‑run the ETL job** | The job should now be able to write all parts without error. | Trigger the Airflow/Dagster/Spark job as usual and monitor the logs for successful uploads. |
+| 6 | **Add monitoring / alerting (optional but recommended)** | Prevents silent failures in the future. | Enable S3 Event notifications or CloudWatch Alarms on `AccessDenied` errors for the bucket. |
+
+---
+
+### Quick checklist
+
+- ✅ IAM role `etl-runner` → policy includes `s3:PutObject` on `arn:aws:s3:::acme-finance-exports/*`  
+- ✅ No bucket‑policy `Deny` that overrides the role’s allow.  
+- ✅ If KMS‑encrypted, role also has the required KMS actions.  
+- ✅ Test upload works before full pipeline run.
+
+Once these permissions are in place, the `export_job` will be able to write the 18 CSV parts to S3 and the pipeline should complete successfully.",4,False,True,
+O02,out_of_scope,UNKNOWN_ERROR,"Not one of the 6 types: a dbt / SQL compilation error, invalid column CUSTOMER_REGION_CD. The agent should name this, not force a Spark/Airflow/Kafka fix.",UNKNOWN_ERROR,True,read_log_file > identify_error_type > list_available_logs > get_fix_suggestion,UNKNOWN_ERROR,UNKNOWN_ERROR,SQL compilation error: error line 14 at position 8 invalid identifier 'CUSTOMER_REGION_CD',"**Log excerpt (the key error)**  
+
+```
+09:30:12  Running with dbt=1.8.2
+09:30:15  1 of 6 START sql table model analytics.dim_customers ........................ [RUN]
+09:30:18  1 of 6 ERROR creating sql table model analytics.dim_customers ............... [ERROR in 2.81s]
+09:30:19  Completed with 1 error and 0 warnings:
+09:30:19  Database Error in model dim_customers (models/marts/dim_customers.sql)
+  000904 (42000): SQL compilation error: error line 14 at position 8
+  invalid identifier 'CUSTOMER_REGION_CD'
+```
+
+### Root cause
+`dbt` tried to compile the model **`analytics.dim_customers`** and hit a **SQL compilation error** because the identifier **`CUSTOMER_REGION_CD`** does not exist (or is not visible) in the underlying source table(s) referenced on line 14 of `models/marts/dim_customers.sql`.
+
+Typical reasons for this specific error are:
+
+| Reason | What it means |
+|--------|----------------|
+| **Column typo** | The column name is miss‑spelled (e.g., `CUSTOMER_REGION_CD` vs. `CUSTOMER_REGION_CODE`). |
+| **Column missing in source** | The source table (or view) that the model selects from does not contain that column – perhaps the source schema changed. |
+| **Case‑sensitivity / quoting** | In Snowflake (or other warehouses) unquoted identifiers are automatically upper‑cased. If the column was created with mixed case and quoted, you must reference it exactly (e.g., `""customer_region_cd""`). |
+| **Stale source definition** | The `sources` block in `schema.yml` (or the `ref()` target) points to an older version of the table that lacks the column. |
+| **Incorrect database / schema** | The model is pointing at the wrong database/schema where the column does not exist. |
+
+### How to fix it
+
+1. **Locate the offending line**  
+   Open `models/marts/dim_customers.sql` and go to **line 14** (the line reported by the compiler). Identify the exact reference to `CUSTOMER_REGION_CD`.
+
+2. **Validate the source schema**  
+   - Run a quick query in your warehouse (e.g., Snowflake, Redshift, BigQuery) against the source table that `dim_customers` references:  
+
+     ```sql
+     SELECT *
+     FROM <source_database>.<source_schema>.<source_table>
+     LIMIT 1;
+     ```
+   - Verify whether `CUSTOMER_REGION_CD` appears in the result set.  
+
+3. **If the column is miss‑spelled**  
+   - Correct the spelling in the SQL model to match the actual column name.  
+   - Example: change `CUSTOMER_REGION_CD` → `CUSTOMER_REGION_CODE` (or whatever the correct name is).
+
+4. **If the column is missing from the source**  
+   - **Option A – Add the column**: Work with the data owners / ETL team to add `CUSTOMER_REGION_CD` to the source table (or view) and back‑fill data if needed.  
+   - **Option B – Remove or replace the reference**: If the column is no longer part of the data model, delete the reference from `dim_customers.sql` or replace it with an alternative column that provides the same information.
+
+5. **If case‑sensitivity is the issue**  
+   - Quote the identifier exactly as it exists in the source, e.g.:  
+
+     ```sql
+     SELECT ""customer_region_cd""
+     FROM ...
+     ```
+   - Or, rename the column in the source to an unquoted, all‑caps name to avoid quoting.
+
+6. **Refresh dbt source definitions** (if you use `sources` in `schema.yml`)  
+   ```bash
+   dbt source freshness          # optional, just to see freshness
+   dbt source snapshot-freshness # if you have snapshots
+   dbt run --models +analytics.dim_customers
+   ```
+   This ensures dbt’s internal catalog is up‑to‑date.
+
+7. **Re‑run the model**  
+   ```bash
+   dbt run --models analytics.dim_customers
+   ```
+   The run should now succeed, or you’ll get a new, more specific error if another issue exists.
+
+8. **Add defensive testing (optional but recommended)**  
+   - Create a **schema test** for the column existence:  
+
+     ```yaml
+     models:
+       - name: dim_customers
+         columns:
+           - name: CUSTOMER_REGION_CD
+             tests:
+               - not_null
+               - accepted_values: [...]
+     ```
+   - This will cause dbt to fail early if the column disappears again.
+
+### TL;DR
+
+- **Cause:** The model `analytics.dim_customers` references a column `CUSTOMER_REGION_CD` that does not exist (or is mis‑named/quoted) in the underlying source table, leading to a SQL compilation error.
+- **Fix:** Verify the column’s existence and spelling in the source, correct the reference (or add the column), ensure proper quoting/casing, refresh dbt source metadata, and re‑run the model. Adding a schema test can prevent the same issue from slipping through in the future.",5,False,True,

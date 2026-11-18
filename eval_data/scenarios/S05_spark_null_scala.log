@@ -1,0 +1,6 @@
+26/03/11 08:15:44 ERROR Executor: Exception in task 0.0 in stage 5.0 (TID 61)
+java.lang.NullPointerException
+    at com.acme.etl.OrderEnricher$.$anonfun$enrich$1(OrderEnricher.scala:42)
+    at scala.collection.Iterator$$anon$10.next(Iterator.scala:461)
+    at org.apache.spark.sql.execution.WholeStageCodegenExec.$anonfun$doExecute$4(WholeStageCodegenExec.scala:759)
+26/03/11 08:15:44 WARN TaskSetManager: Lost task 0.0 in stage 5.0 (TID 61) (worker-3 executor 1): java.lang.NullPointerException

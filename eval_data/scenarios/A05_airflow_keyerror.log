@@ -1,0 +1,8 @@
+[2026-03-12, 07:45:09 UTC] {taskinstance.py:2731} ERROR - Task failed with exception
+Traceback (most recent call last):
+  File "/home/airflow/.local/lib/python3.11/site-packages/airflow/operators/python.py", line 235, in execute
+    return_value = self.execute_callable()
+  File "/opt/airflow/dags/crm_sync.py", line 40, in map_contacts
+    email = contact["email_address"]
+KeyError: 'email_address'
+[2026-03-12, 07:45:09 UTC] {taskinstance.py:1149} INFO - Marking task as FAILED. dag_id=crm_sync, task_id=map_contacts

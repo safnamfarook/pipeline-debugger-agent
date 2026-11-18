@@ -1,0 +1,5 @@
+[2026-03-19, 04:10:33 UTC] {spark_submit.py:521} INFO - Running Spark job: spark-submit --master yarn --deploy-mode cluster --executor-memory 2g jobs/build_features.py
+[2026-03-19, 04:31:02 UTC] {spark_submit.py:571} INFO - 26/03/19 04:31:02 ERROR YarnScheduler: Lost executor 3 on node-2: Container killed by YARN for exceeding memory limits. 2.6 GB of 2.5 GB physical memory used.
+[2026-03-19, 04:31:40 UTC] {spark_submit.py:571} INFO - Exception in thread "main" org.apache.spark.SparkException: Job aborted due to stage failure: Task 8 in stage 6.0 failed 4 times, most recent failure: ExecutorLostFailure (executor 3 exited caused by one of the running tasks) Reason: Container killed by YARN for exceeding memory limits.
+[2026-03-19, 04:31:41 UTC] {taskinstance.py:2731} ERROR - Task failed with exception
+airflow.exceptions.AirflowException: Cannot execute: spark-submit --master yarn --deploy-mode cluster --executor-memory 2g jobs/build_features.py. Error code is: 1.

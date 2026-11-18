@@ -1,0 +1,4 @@
+26/03/04 09:41:27 INFO YarnAllocator: Driver requested a total number of 12 executor(s).
+26/03/04 09:58:03 WARN YarnAllocator: Container from a bad node: container_1709541_0004_01_000007 on host: node-5. Exit status: 137.
+26/03/04 09:58:03 ERROR YarnScheduler: Lost executor 6 on node-5: Container killed by YARN for exceeding memory limits. 10.4 GB of 10 GB physical memory used. Consider boosting spark.executor.memoryOverhead.
+26/03/04 09:58:04 WARN TaskSetManager: Lost task 112.1 in stage 7.0 (TID 2290) (node-5 executor 6): ExecutorLostFailure (executor 6 exited caused by one of the running tasks)

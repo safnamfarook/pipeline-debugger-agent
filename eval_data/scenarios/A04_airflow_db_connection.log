@@ -1,0 +1,8 @@
+[2026-03-10, 01:15:22 UTC] {base.py:83} INFO - Using connection ID 'warehouse_postgres' for task execution.
+[2026-03-10, 01:15:52 UTC] {taskinstance.py:2731} ERROR - Task failed with exception
+Traceback (most recent call last):
+  File "/home/airflow/.local/lib/python3.11/site-packages/airflow/providers/postgres/hooks/postgres.py", line 159, in get_conn
+    self.conn = psycopg2.connect(**conn_args)
+psycopg2.OperationalError: connection to server at "warehouse-db.internal" (10.0.4.21), port 5432 failed: Connection timed out
+	Is the server running on that host and accepting TCP/IP connections?
+[2026-03-10, 01:15:52 UTC] {taskinstance.py:1149} INFO - Marking task as FAILED. dag_id=nightly_load, task_id=load_orders

@@ -1,0 +1,6 @@
+2026-03-20 09:12:55,401 INFO export_job: Writing 18 files to s3://acme-finance-exports/2026-03-20/
+2026-03-20 09:12:56,027 ERROR export_job: Upload failed for part-0001.csv
+Traceback (most recent call last):
+  File "/app/export_job.py", line 74, in upload
+    s3.upload_file(local_path, bucket, key)
+botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the PutObject operation: User: arn:aws:iam::412233:role/etl-runner is not authorized to perform: s3:PutObject on resource: "arn:aws:s3:::acme-finance-exports/2026-03-20/part-0001.csv" because no identity-based policy allows the s3:PutObject action

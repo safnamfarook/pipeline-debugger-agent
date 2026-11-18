@@ -1,0 +1,4 @@
+2026-03-14 04:30:12,118 INFO [audit-consumer] o.a.k.c.c.internals.Fetcher: [Consumer clientId=audit-consumer, groupId=audit-archiver] Fetch position FetchPosition{offset=1250331} is out of range for partition audit-events-0
+2026-03-14 04:30:12,120 ERROR [audit-consumer] com.acme.audit.Archiver: Consumer failed
+org.apache.kafka.clients.consumer.OffsetOutOfRangeException: Fetch position FetchPosition{offset=1250331, offsetEpoch=Optional.empty} is out of range for partition audit-events-0
+Note: auto.offset.reset=none, topic retention.ms=86400000 (1 day); consumer group was stopped for 3 days.

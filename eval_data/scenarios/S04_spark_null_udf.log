@@ -1,0 +1,8 @@
+26/03/09 11:02:31 ERROR Executor: Exception in task 3.0 in stage 2.0 (TID 19)
+org.apache.spark.api.python.PythonException: Traceback (most recent call last):
+  File "/jobs/clean_customers.py", line 31, in normalise_email
+    return email.strip().lower()
+AttributeError: 'NoneType' object has no attribute 'strip'
+Caused by: java.lang.NullPointerException
+    at org.apache.spark.sql.catalyst.expressions.GeneratedClass$SpecificUnsafeProjection.apply(Unknown Source)
+26/03/09 11:02:31 WARN TaskSetManager: Lost task 3.0 in stage 2.0 (TID 19) (worker-1 executor 2): java.lang.NullPointerException

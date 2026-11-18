@@ -1,0 +1,7 @@
+09:30:12  Running with dbt=1.8.2
+09:30:15  1 of 6 START sql table model analytics.dim_customers ........................ [RUN]
+09:30:18  1 of 6 ERROR creating sql table model analytics.dim_customers ............... [ERROR in 2.81s]
+09:30:19  Completed with 1 error and 0 warnings:
+09:30:19  Database Error in model dim_customers (models/marts/dim_customers.sql)
+  000904 (42000): SQL compilation error: error line 14 at position 8
+  invalid identifier 'CUSTOMER_REGION_CD'
